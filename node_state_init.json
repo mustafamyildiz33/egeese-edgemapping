@@ -1,4 +1,5 @@
 {
     "accepted_messages": 0,
-    "known_nodes": []
+    "known_nodes": [],
+    "daemon_hits": 0
 }

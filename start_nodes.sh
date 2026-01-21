@@ -7,7 +7,7 @@ touch data.csv
 
 echo "" > run.log
 
-N=25
+N=5
 PORT=9000
 
 for ((i=1; i<=N; i++)); do
