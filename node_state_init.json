@@ -1,5 +1,14 @@
 {
     "accepted_messages": 0,
     "known_nodes": [],
-    "background_hits": 0
+    "background_hits": 0,
+
+    "role": "normal",
+    "sensor_state": "NORMAL",
+    "emergency_mode": false,
+
+    "boundary_edges": [],
+    "missing_streak": {},
+    "last_seen": {},
+    "missing_reports": {}
 }

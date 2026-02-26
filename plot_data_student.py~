@@ -1,0 +1,51 @@
+import matplotlib.pyplot as plt
+
+times = []
+vals = []
+
+with open("data.csv", "r") as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+
+        parts = line.split(";")
+        if len(parts) < 4:
+            continue
+
+        node = parts[0]
+        ts = parts[1]
+        kind = parts[2]
+        msg = parts[3]
+
+        if node != "9000":
+            continue
+        if kind != "state_change":
+            continue
+        if not msg.startswith("accepted_messages="):
+            continue
+
+        try:
+            t = float(ts)
+            v = int(msg.split("=")[1])
+        except:
+            continue
+
+        times.append(t)
+        vals.append(v)
+
+if len(times) == 0:
+    print("no accepted_messages lines found for node 9000")
+    raise SystemExit(1)
+
+t0 = times[0]
+t = [x - t0 for x in times]
+
+plt.step(t, vals, where="post")
+plt.xlabel("time (s)")
+plt.ylabel("accepted_messages")
+plt.title("Node 9000: accepted_messages vs time")
+plt.tight_layout()
+plt.savefig("fig1.pdf")
+plt.savefig("fig1.png", dpi=200)
+print("done")

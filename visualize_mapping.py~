@@ -1,0 +1,629 @@
+#!/usr/bin/env python3
+"""
+EGESS Research Visualizer (Live) — publish-style figure
+
+LEFT  (Network/Gossip):
+  - Spring layout (looks like real gossip, not a grid)
+  - Edges weighted by mutual knowledge
+  - Node size ~ accepted_messages (activity)
+  - Node ring for sentinel role (if present)
+
+RIGHT (Spatial Map 8x8):
+  - Cell color from inferred probability field p_inside (then binned into OUTSIDE/INSIDE/BOUNDARY)
+  - Boundary = contour line where p_inside = 0.5  (true "edge")
+  - Orange cells = high-uncertainty/disagreement band (p in [0.4, 0.6] OR neighbor conflicts)
+  - Gray X = missing/unreachable nodes
+  - Small metrics panel: coverage, graph density, components, boundary length proxy
+
+IMPORTANT:
+- If node_state contains a real sensor field:
+    sensor_state in {"INSIDE","OUTSIDE","BOUNDARY","EVENT","NORMAL"} OR
+    sensor_value numeric (set thresholds via CLI)
+  the visual uses that.
+- Otherwise it falls back to a synthetic seed (radial prior) BUT STILL computes edge using the gossip+grid smoothing,
+  so the figure behaves like a real inference pipeline.
+
+No professor files modified. Visualization-only.
+
+Run:
+  python visualize_mapping.py --n 64 --grid 8
+"""
+
+import argparse
+import json
+import math
+import random
+import time
+from collections import deque
+from urllib import request
+
+import matplotlib.pyplot as plt
+
+
+DEFAULT_ENDPOINTS = ["/"]  # your node.py listens on "/"
+
+
+# -------------------------
+# HTTP helpers
+# -------------------------
+
+def post_json(url: str, payload: dict, timeout: float = 0.75):
+    data = json.dumps(payload).encode("utf-8")
+    req = request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read().decode("utf-8")
+        return json.loads(raw)
+
+
+def pull_node_state(port: int, endpoints):
+    payload = {"op": "pull", "data": {}, "metadata": {}}
+    last_err = None
+    for ep in endpoints:
+        url = f"http://127.0.0.1:{port}{ep}"
+        try:
+            res = post_json(url, payload)
+            if isinstance(res, dict) and res.get("op") == "receipt":
+                data = res.get("data", {})
+                if isinstance(data, dict) and "node_state" in data:
+                    return data["node_state"], ep
+        except Exception as e:
+            last_err = e
+            continue
+    return None, last_err
+
+
+# -------------------------
+# Layout / geometry
+# -------------------------
+
+def grid_coords(base_port: int, n: int, grid: int):
+    coords = {}
+    for idx in range(n):
+        p = base_port + idx
+        r = idx // grid
+        c = idx % grid
+        coords[p] = (c, r)
+    return coords
+
+
+def grid_neighbors(port: int, base_port: int, n: int, grid: int):
+    idx = port - base_port
+    r = idx // grid
+    c = idx % grid
+    out = []
+    for dr, dc in [(-1,0),(1,0),(0,-1),(0,1)]:
+        rr = r + dr
+        cc = c + dc
+        if 0 <= rr < grid and 0 <= cc < grid:
+            j = rr * grid + cc
+            if 0 <= j < n:
+                out.append(base_port + j)
+    return out
+
+
+# -------------------------
+# Graph utilities
+# -------------------------
+
+def build_edges(states_by_port, base_port, n):
+    """
+    Returns:
+      edges: list[(a,b,weight)]
+      adj: dict[port] -> list[neighbor]
+      density, components
+    """
+    edge_w = {}
+    adj = {p: [] for p in range(base_port, base_port + n)}
+
+    # directed mentions
+    for p, st in states_by_port.items():
+        known = st.get("known_nodes", [])
+        if not isinstance(known, list):
+            continue
+        for k in known:
+            if not isinstance(k, int):
+                continue
+            if k < base_port or k >= base_port + n:
+                continue
+            a, b = sorted((p, k))
+            edge_w[(a, b)] = edge_w.get((a, b), 0) + 1
+
+    # mutual boost
+    for (a, b) in list(edge_w.keys()):
+        ak = states_by_port.get(a, {}).get("known_nodes", [])
+        bk = states_by_port.get(b, {}).get("known_nodes", [])
+        if isinstance(ak, list) and isinstance(bk, list):
+            if (b in ak) and (a in bk):
+                edge_w[(a, b)] += 2
+
+    edges = []
+    for (a, b), w in edge_w.items():
+        edges.append((a, b, w))
+        adj[a].append(b)
+        adj[b].append(a)
+
+    # density (undirected)
+    V = n
+    E = len(edge_w)
+    density = (2 * E) / (V * (V - 1)) if V > 1 else 0.0
+
+    # components (over ports that are present or missing—still count all nodes)
+    seen = set()
+    comps = 0
+    for p in range(base_port, base_port + n):
+        if p in seen:
+            continue
+        comps += 1
+        q = deque([p])
+        seen.add(p)
+        while q:
+            u = q.popleft()
+            for v in adj.get(u, []):
+                if v not in seen:
+                    seen.add(v)
+                    q.append(v)
+
+    return edges, adj, density, comps
+
+
+def spring_layout(nodes, edges, iterations=80, seed=7):
+    """
+    Small dependency-free Fruchterman-Reingold-ish layout.
+    nodes: list[port]
+    edges: list[(a,b,w)]
+    returns pos dict: port -> (x,y) in [0,1]
+    """
+    rnd = random.Random(seed)
+    pos = {p: (rnd.random(), rnd.random()) for p in nodes}
+
+    if not nodes:
+        return pos
+
+    k = math.sqrt(1.0 / max(1, len(nodes)))
+    area = 1.0
+
+    def sub(a, b):
+        return (a[0]-b[0], a[1]-b[1])
+
+    def add(a, b):
+        return (a[0]+b[0], a[1]+b[1])
+
+    def mul(a, s):
+        return (a[0]*s, a[1]*s)
+
+    def norm(v):
+        return math.sqrt(v[0]*v[0] + v[1]*v[1]) + 1e-9
+
+    # map for quick edge check
+    edge_set = set()
+    weights = {}
+    for a, b, w in edges:
+        aa, bb = sorted((a, b))
+        edge_set.add((aa, bb))
+        weights[(aa, bb)] = w
+
+    t = 0.10
+    for _ in range(iterations):
+        disp = {p: (0.0, 0.0) for p in nodes}
+
+        # repulsion
+        for i in range(len(nodes)):
+            v = nodes[i]
+            for j in range(i+1, len(nodes)):
+                u = nodes[j]
+                delta = sub(pos[v], pos[u])
+                d = norm(delta)
+                force = (k*k) / d
+                dv = mul(delta, force / d)
+                disp[v] = add(disp[v], dv)
+                disp[u] = sub(disp[u], dv)
+
+        # attraction
+        for a, b, w in edges:
+            delta = sub(pos[a], pos[b])
+            d = norm(delta)
+            # stronger edges pull more
+            force = (d*d / k) * (1.0 + 0.15 * min(w, 8))
+            dv = mul(delta, force / d)
+            disp[a] = sub(disp[a], dv)
+            disp[b] = add(disp[b], dv)
+
+        # update positions
+        for v in nodes:
+            d = norm(disp[v])
+            step = min(d, t)
+            newp = add(pos[v], mul(disp[v], step / d))
+            # keep inside unit square
+            pos[v] = (min(1.0, max(0.0, newp[0])), min(1.0, max(0.0, newp[1])))
+
+        t *= 0.97
+
+    return pos
+
+
+# -------------------------
+# Inference (probability field)
+# -------------------------
+
+def sensor_seed_probability(port, st, coords, grid, inside_threshold, outside_threshold):
+    """
+    Return (p_inside, used_real_sensor: bool)
+    - If st has sensor_state or sensor_value -> use it.
+    - Else use a radial prior (synthetic seed).
+    """
+    if st is None:
+        return None, False
+
+    # 1) sensor_state (categorical)
+    sstate = st.get("sensor_state", None)
+    if isinstance(sstate, str):
+        ss = sstate.strip().upper()
+        if ss in ["INSIDE", "EVENT", "HOT", "ALERT"]:
+            return 0.95, True
+        if ss in ["OUTSIDE", "NORMAL", "SAFE", "COLD"]:
+            return 0.05, True
+        if ss in ["BOUNDARY", "DISAGREE", "EDGE"]:
+            return 0.50, True
+
+    # 2) sensor_value (numeric)
+    sval = st.get("sensor_value", None)
+    if isinstance(sval, (int, float)):
+        if sval >= inside_threshold:
+            return 0.95, True
+        if sval <= outside_threshold:
+            return 0.05, True
+        # in-between is uncertain
+        return 0.50, True
+
+    # 3) fallback radial prior
+    x, y = coords[port]
+    cx = (grid - 1) / 2.0
+    cy = (grid - 1) / 2.0
+    d = math.sqrt((x - cx) ** 2 + (y - cy) ** 2)
+    # inside-ish near center
+    # (this is only a seed; the smoothing will reshape it)
+    p = max(0.0, min(1.0, 1.0 - (d / (grid * 0.55))))
+    return p, False
+
+
+def smooth_probability_field(base_port, n, grid, coords, states_by_port, adj_gossip,
+                             iters=12, w=0.62, inert=0.25,
+                             inside_threshold=0.7, outside_threshold=0.3):
+    """
+    Produces p_inside for each port using:
+      - grid neighbors (spatial)
+      - gossip neighbors (known_nodes graph)
+    Update rule:
+      p <- inert*p + (1-inert)*((1-w)*p + w*avg(neighbors))
+    Missing nodes return None.
+    """
+    p = {}
+    used_real = False
+
+    for i in range(n):
+        port = base_port + i
+        st = states_by_port.get(port)
+        if st is None:
+            p[port] = None
+            continue
+        seed, real = sensor_seed_probability(port, st, coords, grid, inside_threshold, outside_threshold)
+        used_real = used_real or real
+        p[port] = seed
+
+    def neighbor_list(port):
+        # spatial + gossip, de-dup
+        nb = set()
+        for q in grid_neighbors(port, base_port, n, grid):
+            nb.add(q)
+        for q in adj_gossip.get(port, []):
+            nb.add(q)
+        return list(nb)
+
+    for _ in range(iters):
+        newp = dict(p)
+        for i in range(n):
+            port = base_port + i
+            if p[port] is None:
+                continue
+            nbs = neighbor_list(port)
+            vals = [p[q] for q in nbs if p.get(q) is not None]
+            if not vals:
+                continue
+            avg = sum(vals) / len(vals)
+            blended = (1.0 - w) * p[port] + w * avg
+            newp[port] = inert * p[port] + (1.0 - inert) * blended
+        p = newp
+
+    return p, used_real
+
+
+def classify_cell(p_inside, missing, band=(0.40, 0.60)):
+    if missing or p_inside is None:
+        return "MISSING"
+    if band[0] <= p_inside <= band[1]:
+        return "BOUNDARY"
+    return "INSIDE" if p_inside > 0.5 else "OUTSIDE"
+
+
+def state_to_color(state: str):
+    if state == "INSIDE":
+        return "#d94b4b"    # red
+    if state == "BOUNDARY":
+        return "#f0b54d"    # orange
+    if state == "OUTSIDE":
+        return "#2f6fb3"    # blue
+    return "#bdbdbd"        # gray
+
+
+# -------------------------
+# Drawing
+# -------------------------
+
+def draw_network(ax, nodes, edges, pos, p_inside_by_port, class_by_port, states_by_port,
+                 base_port, n, title_suffix):
+    ax.clear()
+    ax.set_title(f"EGESS Gossip View (Research)  |  {title_suffix}\n"
+                 f"Spring layout • size=accepted_messages • contour-driven states",
+                 fontsize=10)
+
+    # draw edges (thicker = stronger/mutual)
+    for a, b, w in edges:
+        if a not in pos or b not in pos:
+            continue
+        x1, y1 = pos[a]
+        x2, y2 = pos[b]
+        lw = 0.4 + 0.35 * min(w, 8)
+        ax.plot([x1, x2], [y1, y2], linewidth=lw, alpha=0.25, color="black")
+
+    # nodes
+    for port in nodes:
+        x, y = pos[port]
+        missing = port not in states_by_port
+
+        cls = class_by_port.get(port, "MISSING")
+        face = state_to_color(cls)
+
+        # size ~ activity
+        st = states_by_port.get(port, {})
+        act = st.get("accepted_messages", 0)
+        if not isinstance(act, int):
+            act = 0
+        s = 60 + 6 * min(act, 40)
+
+        if missing:
+            ax.scatter([x], [y], s=s, marker="x", color="black")
+        else:
+            ax.scatter([x], [y], s=s, marker="o", c=[face], edgecolors="black", linewidths=0.6)
+
+        # sentinel ring
+        role = st.get("role", "normal")
+        if (not missing) and isinstance(role, str) and role.lower() == "sentinel":
+            ax.scatter([x], [y], s=s*1.9, marker="o", facecolors="none", edgecolors="black", linewidths=1.2)
+
+        # label
+        ax.text(x, y - 0.035, str(port), ha="center", va="top", fontsize=7)
+
+    ax.set_xlim(-0.05, 1.05)
+    ax.set_ylim(1.05, -0.05)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.set_aspect("equal", adjustable="box")
+
+
+def draw_map(ax, base_port, n, grid, coords, p_inside_by_port, states_by_port,
+             title_suffix, band=(0.40, 0.60)):
+    ax.clear()
+    ax.set_title(
+        f"EGESS Grid Map ({grid}x{grid}) — Probabilistic Edge  |  {title_suffix}\n"
+        f"BLUE=outside  RED=inside  ORANGE=uncertainty/boundary  GRAY=missing  •  boundary=contour(p=0.5)",
+        fontsize=10
+    )
+
+    missing_ports = []
+    class_by_port = {}
+
+    # draw cells
+    for i in range(n):
+        port = base_port + i
+        x, y = coords[port]
+        missing = port not in states_by_port
+        if missing:
+            missing_ports.append(port)
+
+        p = p_inside_by_port.get(port)
+        cls = classify_cell(p, missing, band=band)
+        class_by_port[port] = cls
+        face = state_to_color(cls)
+
+        ax.add_patch(plt.Rectangle((x, y), 1, 1, fill=True, facecolor=face, edgecolor="black", linewidth=0.35))
+        ax.text(x + 0.5, y + 0.52, str(port), ha="center", va="center", fontsize=7, color="black")
+
+        if missing:
+            ax.plot([x + 0.2, x + 0.8], [y + 0.2, y + 0.8], linewidth=1.2, color="black")
+            ax.plot([x + 0.8, x + 0.2], [y + 0.2, y + 0.8], linewidth=1.2, color="black")
+
+    # contour boundary from probability field
+    # build a grid array Z of p_inside (missing -> NaN)
+    Z = [[float("nan") for _ in range(grid)] for __ in range(grid)]
+    for i in range(n):
+        port = base_port + i
+        c, r = coords[port]
+        val = p_inside_by_port.get(port)
+        if val is None or port not in states_by_port:
+            continue
+        Z[r][c] = val
+
+    # contour expects x,y as increasing; we match our cell coords:
+    # cells are [0..grid] in both; centers at +0.5
+    import numpy as np
+    Znp = np.array(Z, dtype=float)
+    xs = np.arange(0.5, grid, 1.0)
+    ys = np.arange(0.5, grid, 1.0)
+
+    # if there is enough data, draw contour
+    if np.isfinite(Znp).sum() >= 8:
+        try:
+            ax.contour(xs, ys, Znp, levels=[0.5], linewidths=2.2, colors="black", alpha=0.85)
+        except Exception:
+            pass
+
+    ax.set_xlim(0, grid)
+    ax.set_ylim(grid, 0)
+    ax.set_aspect("equal", adjustable="box")
+    ax.set_xticks([])
+    ax.set_yticks([])
+
+    ax.text(0.02, -0.06,
+            f"Missing: {missing_ports[:18]}{'...' if len(missing_ports) > 18 else ''}",
+            transform=ax.transAxes, fontsize=9, va="top")
+
+    return class_by_port, missing_ports
+
+
+def boundary_length_proxy(base_port, n, grid, class_by_port):
+    """
+    Count neighbor disagreements across 4-neighborhood as a simple boundary-length proxy.
+    """
+    b = 0
+    for i in range(n):
+        p = base_port + i
+        s = class_by_port.get(p, "MISSING")
+        if s == "MISSING":
+            continue
+        for q in grid_neighbors(p, base_port, n, grid):
+            t = class_by_port.get(q, "MISSING")
+            if t == "MISSING":
+                continue
+            if s != t:
+                b += 1
+    return b // 2
+
+
+def draw_metrics(ax, coverage, density, comps, boundary_len, used_real_sensor):
+    ax.clear()
+    ax.axis("off")
+    lines = [
+        "Research Metrics (Live)",
+        f"Coverage: {coverage:.1f}%",
+        f"Graph density: {density:.4f}",
+        f"Connected components: {comps}",
+        f"Boundary length proxy: {boundary_len}",
+        f"Seed source: {'REAL sensor field' if used_real_sensor else 'synthetic prior (no sensor_state/value in node_state)'}",
+        "",
+        "Tip for publish-level validity:",
+        "Add sensor_state or sensor_value to node_state",
+        "then the same pipeline becomes a real estimator."
+    ]
+    ax.text(0.02, 0.98, "\n".join(lines), va="top", ha="left", fontsize=9)
+
+
+# -------------------------
+# Main loop
+# -------------------------
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--base-port", type=int, default=9000)
+    ap.add_argument("--n", type=int, default=64)
+    ap.add_argument("--grid", type=int, default=8)
+    ap.add_argument("--fps", type=float, default=2.0)
+    ap.add_argument("--smooth-iters", type=int, default=12)
+    ap.add_argument("--smooth-w", type=float, default=0.62)
+    ap.add_argument("--smooth-inert", type=float, default=0.25)
+    ap.add_argument("--band-low", type=float, default=0.40)
+    ap.add_argument("--band-high", type=float, default=0.60)
+    ap.add_argument("--inside-threshold", type=float, default=0.70, help="Used if sensor_value exists")
+    ap.add_argument("--outside-threshold", type=float, default=0.30, help="Used if sensor_value exists")
+    args = ap.parse_args()
+
+    base_port = args.base_port
+    n = args.n
+    grid = args.grid
+    endpoints = DEFAULT_ENDPOINTS
+
+    coords = grid_coords(base_port, n, grid)
+
+    plt.figure(figsize=(15.2, 7.2))
+    gs = plt.GridSpec(1, 3, width_ratios=[1.08, 1.12, 0.60], wspace=0.12)
+    ax_net = plt.subplot(gs[0, 0])
+    ax_map = plt.subplot(gs[0, 1])
+    ax_met = plt.subplot(gs[0, 2])
+
+    while True:
+        states_by_port = {}
+        ok_ep = None
+
+        for i in range(n):
+            p = base_port + i
+            st, meta = pull_node_state(p, endpoints=endpoints)
+            if st is not None:
+                states_by_port[p] = st
+                ok_ep = ok_ep or meta
+
+        # graph
+        edges, adj, density, comps = build_edges(states_by_port, base_port, n)
+
+        # probability field
+        p_inside, used_real_sensor = smooth_probability_field(
+            base_port=base_port,
+            n=n,
+            grid=grid,
+            coords=coords,
+            states_by_port=states_by_port,
+            adj_gossip=adj,
+            iters=args.smooth_iters,
+            w=args.smooth_w,
+            inert=args.smooth_inert,
+            inside_threshold=args.inside_threshold,
+            outside_threshold=args.outside_threshold,
+        )
+
+        # map + classification
+        title_suffix = f"endpoint={ok_ep or 'unreachable'}  |  {time.strftime('%H:%M:%S')}"
+        class_by_port, missing_ports = draw_map(
+            ax=ax_map,
+            base_port=base_port,
+            n=n,
+            grid=grid,
+            coords=coords,
+            p_inside_by_port=p_inside,
+            states_by_port=states_by_port,
+            title_suffix=title_suffix,
+            band=(args.band_low, args.band_high),
+        )
+
+        # boundary proxy
+        b_len = boundary_length_proxy(base_port, n, grid, class_by_port)
+
+        # network layout (only for reachable nodes; missing don't add info)
+        nodes = [base_port + i for i in range(n)]
+        pos = spring_layout(nodes, edges, iterations=80, seed=7)
+
+        # network view
+        draw_network(
+            ax=ax_net,
+            nodes=nodes,
+            edges=edges,
+            pos=pos,
+            p_inside_by_port=p_inside,
+            class_by_port=class_by_port,
+            states_by_port=states_by_port,
+            base_port=base_port,
+            n=n,
+            title_suffix=title_suffix,
+        )
+
+        # metrics
+        coverage = 100.0 * (len(states_by_port) / max(1, n))
+        draw_metrics(ax_met, coverage, density, comps, b_len, used_real_sensor)
+
+        plt.pause(max(0.001, 1.0 / max(0.25, args.fps)))
+
+
+if __name__ == "__main__":
+    main()

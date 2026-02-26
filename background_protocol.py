@@ -24,6 +24,7 @@
 
 
 import egess_api # To access common EGESS functions
+import math
 
 def background_protocol(config_json, node_state, state_lock, this_port, number_of_nodes, push_queue):
      """
@@ -42,10 +43,33 @@ def background_protocol(config_json, node_state, state_lock, this_port, number_o
      # Increment the number of background hits (invocations of this function) recorded
      # in the node's state
      node_state["background_hits"] = node_state["background_hits"] + 1
+
+     # ------------------------------------------------------------------
+     # Minimal "sensor reading" for an 8x8 map demo:
+     # - Nodes store grid_pos = [x, y] in node.py at startup
+     # - We generate a stable "hot" (RED) region in the center and BLUE outside
+     # ------------------------------------------------------------------
+     grid_size = node_state.get("grid_size", 8)
+     pos = node_state.get("grid_pos", [0, 0])
+     x = int(pos[0])
+     y = int(pos[1])
+
+     # Center blob parameters (tune radius if you want a bigger/smaller red core)
+     cx = (grid_size - 1) / 2.0
+     cy = (grid_size - 1) / 2.0
+     radius = 2.0
+
+     dist = math.sqrt((x - cx) ** 2 + (y - cy) ** 2)
+
+     # Local reading: BLUE outside, RED inside
+     if dist <= radius:
+          node_state["local_reading"] = "RED"
+     else:
+          node_state["local_reading"] = "BLUE"
+     # ------------------------------------------------------------------
+
      # Log current node state (the message will appear in run.log)
      egess_api.log_current_node_state(this_port, node_state)
      # Add the state change data point.
      egess_api.write_state_change_data_point(this_port, node_state, "background_hits")
      state_lock.release() # Allow state access by other threads
-
-

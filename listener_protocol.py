@@ -20,6 +20,7 @@
 # -------------------------------------------------------------------------
 
 
+import time
 import egess_api # Used for invoking commonly used EGESS API functions
 
 
@@ -35,18 +36,10 @@ def listener_protocol(config_json, node_state, state_lock, this_port, number_of_
         number_of_nodes (int): The total number of nodes in the network (if known).
         push_queue (queue.Queue): The queue for messages to be pushed to other node(s).
         msg (dict[str, Any]): JSON object received via POST protocol.
-    """    
+    """
     if msg["op"] == "pull": # Indicates that the message is a "pull" request
         print("PULL REQUEST RECEIVED\n") # Log receiving the request
-        # And add it to the data storage with "pull_request_received" type
         egess_api.write_data_point(this_port, "pull_request_received", str(0))
-        # Pull requests are basically requests for updates, and they are
-        # to be responded immediately within the same session. This response,
-        # for example, sends the state of the current node to the pull requester.
-        # Each message, regardless of purpose, must be a JSON object with three keys:
-        # 1) op - singifying the type of operation;
-        # 2) data - signifying the payload;
-        # 3) metadata - providing some transport information about he message itself.
         return {
             "op": "receipt",
             "data": {
@@ -56,50 +49,49 @@ def listener_protocol(config_json, node_state, state_lock, this_port, number_of_
             },
             "metadata": {}
         }
+
     elif msg["op"] == "push": # If the message is a "push" message
-        # Safeguard prefenting the message from being forwarded forever
         if msg["metadata"]["forward_count"] < config_json["max_forwards"]:
-            # We are going to access the state of the node, so we have to lock it first
             state_lock.acquire()
-            # If we are here, the push message has been accepted. Increment the number
-            # of accepted messages in the state.
             node_state["accepted_messages"] = node_state["accepted_messages"] + 1
 
-
-            # The parameter metadata.relay stores the port (node ID) of the node that forwarded the message.
-            # If this node hasn't seen this relay before, add it to the list of known nodes in the state
-            # of the node. However, if the relay is 0, it means that the message is not forwarded, so we
-            # should not add it to the list of known nodes.
             if msg["metadata"]["relay"] not in node_state["known_nodes"] and msg["metadata"]["relay"] != 0:
                 node_state["known_nodes"].append(msg["metadata"]["relay"])
 
-            # Add the state change data point.
+            data = msg.get("data", {})
+            mtype = ""
+            if isinstance(data, dict):
+                mtype = data.get("type", "")
+
+            origin = msg.get("metadata", {}).get("origin", 0)
+            now = time.time()
+
+            if mtype == "heartbeat":
+                if isinstance(origin, int) and origin != 0:
+                    if "last_seen" not in node_state or not isinstance(node_state["last_seen"], dict):
+                        node_state["last_seen"] = {}
+                    node_state["last_seen"][str(origin)] = now
+
+            if mtype == "missing_report":
+                missing_port = 0
+                if isinstance(data, dict):
+                    missing_port = data.get("missing_port", 0)
+                if isinstance(origin, int) and origin != 0 and isinstance(missing_port, int) and missing_port != 0:
+                    if "missing_reports" not in node_state or not isinstance(node_state["missing_reports"], dict):
+                        node_state["missing_reports"] = {}
+                    key = str(missing_port)
+                    if key not in node_state["missing_reports"]:
+                        node_state["missing_reports"][key] = 0
+                    node_state["missing_reports"][key] = int(node_state["missing_reports"][key]) + 1
+
             egess_api.write_state_change_data_point(this_port, node_state, "accepted_messages")
-
-            # Add the state change data point.
             egess_api.write_state_change_data_point(this_port, node_state, "known_nodes")
-
-            # We finished the atomic access to the state of the node; now allow other threads to access it.
             state_lock.release()
 
-            
-            # The forward count and the relay port are stored in the metadata of the message.
-            # The metadata field allows not to contaminate the data with transportation-related
-            # parameters. This may be important if the data is digitally signed by the original sender.
-            
-            # Before we push the message to the push queue for further forwarding, we have to update the
-            # metadata of the message. First, we record that the message is coming from this port.
             msg["metadata"]["relay"] = this_port
-
-            # Second, we increment the forwarding count to make sure that the message is not forwarded
-            # within the network forever.
             msg["metadata"]["forward_count"] = msg["metadata"]["forward_count"] + 1
-
-            # Add the message to the push queue. It will be received by the push thread and processed
-            # by the push protocol.
             push_queue.put(msg)
 
-            # The returned message will be sent back to the caller as a response.
             return {
                 "op": "receipt",
                 "data": {
@@ -109,8 +101,6 @@ def listener_protocol(config_json, node_state, state_lock, this_port, number_of_
                 "metadata": {}
             }
         else:
-            # If the maximum number of forwards has been reached, the message will no longer be
-            # pushed forward
             return {
                 "op": "receipt",
                 "data": {
@@ -119,13 +109,14 @@ def listener_protocol(config_json, node_state, state_lock, this_port, number_of_
                 },
                 "metadata": {}
             }
-    else: # The listener protocol must not receive any other types of messages
+
+    else:
         print("ERROR: listener_protocol: unknown type of message: {}\n".format(msg["op"]))
         return {
-                "op": "receipt",
-                "data": {
-                    "success": False,
-                    "message": "unknown operation"
-                },
-                "metadata": {}
-            }
+            "op": "receipt",
+            "data": {
+                "success": False,
+                "message": "unknown operation"
+            },
+            "metadata": {}
+        }

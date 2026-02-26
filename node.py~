@@ -93,7 +93,7 @@ def listener(config_json, node_state, state_lock, this_port, number_of_nodes, pu
             msg = request.get_json() # The message is a legitimate JSON object
             # Invoke the listener protocol for this message
             return listener_protocol.listener_protocol(config_json, node_state, state_lock, this_port, number_of_nodes, push_queue, msg)
-
+    
     app.run(host=config_json["base_host"], port=this_port)
 
 
@@ -122,7 +122,7 @@ def main():
         print("ERROR Two arguments expected.")
         print("USAGE: {} <port> <number_of_nodes>".format(sys.argv[0]))
         exit(1)
-
+    
     config_file = "config.json" # This file has the configuration that applies to all nodes.
     node_state_init_file = "node_state_init.json" # This is the initial "seed" state that each node is initialized with.
 
@@ -135,33 +135,9 @@ def main():
     with open(node_state_init_file) as file: # Real the initial state for all nodes
         node_state = json.load(file) # Convert into JSON object. ATTENTION: this object can only be used with a state lock
 
-    # -------------------------------------------------------------------------
-    # Minimal 8x8 grid metadata for "map" visualization:
-    # - Each node gets a fixed grid position based on its port
-    # - Border nodes are marked as "sentinel" (low-energy watchers)
-    # - local_reading is updated in background_protocol.py
-    # -------------------------------------------------------------------------
-    grid_size = 8
-    base_port = config_json.get("base_port", 9000)
-    idx = this_port - int(base_port)
-    gx = int(idx % grid_size)
-    gy = int(idx // grid_size)
-
-    node_state["grid_size"] = grid_size
-    node_state["grid_pos"] = [gx, gy]
-
-    if gx == 0 or gx == grid_size - 1 or gy == 0 or gy == grid_size - 1:
-        node_state["role"] = "sentinel"
-    else:
-        node_state["role"] = "normal"
-
-    # Default until background updates it
-    node_state.setdefault("local_reading", "BLUE")
-    # -------------------------------------------------------------------------
-
     # Add a latency matrix to the initial state
     # Latency matrix represents latency in seconds between a pair of nodes
-    # As the nodes change their configuration (e.g., physically move), the
+    # As the nodes change their configuration (e.g., physically move), the 
     # latency matrix can dynamically change to represent this.
     node_state["latency_matrix"] = []
 
@@ -170,14 +146,14 @@ def main():
         row = []
         for j in range(number_of_nodes):
             row.append(config_json["default_latency"])
-            node_state["latency_matrix"].append(row)
+            node_state["latency_matrix"].append(row)        
 
     # State lock for thread safety of the node_state object.
     # ATTENTION: Never read or write from/to the node_state object before acquiring the state_lock first
     # ATTENTION: Make sure that the state_lock object is released right after accessing the node_state object
     #               ("accessing" may mean an atomic sequence of read-writes).
-    state_lock = threading.Lock()
-
+    state_lock = threading.Lock() 
+    
     # Create a push queue object. Each time we want to propagate/push/forward a message, we should use this queue.
     # The maximal size of the queue is specified in the all-nodes configuration file.
     push_queue = queue.Queue(maxsize=config_json["push_queue_maxsize"])
@@ -193,11 +169,11 @@ def main():
     # Create the background thread. The background thread changes the state of the current node on its own schedule.
     # It is not directly invoked or controlled by incoming message or any queue. Essentially, it is only controlled by
     # the progression of time or other local characteristics (such as local sensor readings). For instance, if the current
-    # node is a UAV (drone), then it would be the background thread that updates the state of the node to reflect the
+    # node is a UAV (drone), then it would be the background thread that updates the state of the node to reflect the 
     # current GPS coordinates and altitude of the drone.
     background_thread = threading.Thread(target=background, args=(config_json, node_state, state_lock, this_port, number_of_nodes, push_queue))
     # The background thread must start before the listener and pull threads to ensure the accuracy of the node's state
-    background_thread.start()
+    background_thread.start() 
 
     # Create a pull thread. This thread opens up the port, listens for the incoming messages, checks if the messages
     # are in JSON format, and then passes them to the listener protocol function for further processing.
