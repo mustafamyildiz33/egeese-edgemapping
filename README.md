@@ -11,13 +11,14 @@ This project uses *Google style* docstrings. Although this is a scientific proje
 
 ### Step I: Start the nodes
 ```
-./start_nodes.sh
+EGESS_LOG=1 ./start_nodes.sh 16
 ```
 
 ### Step II: Observe the logs in real time
 Possibly in another terminal (but in the same directory):
 ```
-tail -f run.log
+RUN_DIR=$(ls -1t runs | head -n 1)
+tail -f runs/$RUN_DIR/node_9000.log
 ```
 This will likely be producing a lot of telemetry. `Ctrl+C` stops it.
 
@@ -25,8 +26,30 @@ This will likely be producing a lot of telemetry. `Ctrl+C` stops it.
 If needed, send a trigger message to initiate the forwarding sequence. You can repeat it as needed. For example, if you want to send the trigger message to port 9002 (the third node), then the command will be as follows:
 
 ```
-python3 trigger.py 9002 trigger_msg.json
+./.venv/bin/python trigger.py 9002 trigger_msg.json
 ```
+
+### Live Demo Controls (Visualizer)
+Run the live visualizer in a separate terminal:
+```
+./.venv/bin/python visualize_mapping.py --base-port 9000 --n 16 --grid 4
+```
+Inside the map:
+- Click a node in either panel: select + zoom to that node and show inspector details (`T`, trend, drivers, message counters, recent pull/push traffic).
+- Press `1..6`: toggle manual disagreement slots for the selected node (each active slot contributes `+1` to `T`).
+- Press `0`: clear all manual disagreement slots for the selected node.
+- Press `d`: delete the selected node (inject `crash_sim`, node becomes unreachable).
+- Press `a`: add/recover the selected node (disable `crash_sim`).
+- Press `l`: toggle `lie_sensor` on selected node.
+- Press `f`: toggle `flap` on selected node.
+- Press `r` / `Esc` / `Home`: reset view.
+- Press `q`: quit the visualizer.
+
+Hands-off automatic fire/bomb demo (no key presses):
+```
+./.venv/bin/python visualize_mapping.py --base-port 9000 --n 16 --grid 4 --auto-demo firebomb --auto-period 10
+```
+This cycles through baseline -> fire/disagreement -> bomb/crash -> recovery, and auto-sends push messages.
 
 ### Step IV: Stop the nodes
 Stop the network and kill all nodes using this command:
@@ -35,7 +58,7 @@ Stop the network and kill all nodes using this command:
 ```
 
 ### Step V: Observe the logs and the data
-After running, the CSV-formatted data is in `data.csv` and the log of all the output is in `run.log`. Please note that the data will be backed up in `backupdata` next time you run `start_nodes.sh`. The message log, however, will be erased upon next run of `start_nodes.sh`. Logs, data and backups of data will be ignored by Git.
+After running, all node logs are written to `runs/<timestamp>/node_<port>.log`. In demo mode, CSV telemetry is disabled by default (`EGESS_LOG=0` in `start_nodes.sh`); if enabled, telemetry is written to `runs/<timestamp>/data.csv`.
 
 ## A note about logging messages
-All the messages to accrue `run.log` should be done with **a single argument**. In other words, the `print()` function must not use any commas to separate logged fields; use `format()` instead. Otherwise, the separate arguments of `print()` might be logged in separate spots in the log. Also, it is important to finish each string with a newline, even though `print()` adds a newline to the output. For example, if you want to log the message `foo`, you must do it like this: `print("foo\n")`.
+All log writes should use **a single string argument**. In other words, the `print()` function must not use commas to separate fields; use `format()` instead. Otherwise, separate arguments may interleave across concurrent node logs.

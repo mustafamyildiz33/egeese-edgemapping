@@ -1,10 +1,29 @@
 {
-    "version": 2,
-    "base_host": "127.0.0.1",
-    "base_port": 9000,
-    "max_forwards": 5,
-    "push_queue_maxsize": 5000,
-    "pull_period": 7,
-    "background_period": 5,
-    "default_latency": 0.5
+  "version": 3,
+  "base_host": "127.0.0.1",
+  "base_port": 9000,
+
+  "grid_size": 8,
+
+  "push_queue_maxsize": 5000,
+
+  "background_period": 2,
+  "pull_period": 2,
+
+  "default_latency": 0.05,
+
+  "missing_debounce_m": 3,
+
+  "T_high": 4,
+  "T_low": 2,
+
+  "verify_jitter_max_ticks": 2,
+  "verify_cooldown_base_ticks": 8,
+  "verify_cooldown_max_ticks": 80,
+
+  "push_neighbor_fanout": 2,
+
+  "alert_ttl": 8,
+  "alert_fanout": 2,
+  "max_forwards": 8
 }

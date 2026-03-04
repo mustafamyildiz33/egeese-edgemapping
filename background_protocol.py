@@ -14,62 +14,56 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-
-# -------------------------------------------------------------------------
-# This file contains the background protocol of the node. The background
-# protocol is running by itself and is not directly triggered by messages
-# or queues.
-# -------------------------------------------------------------------------
-
-
-
-import egess_api # To access common EGESS functions
+import os
 import math
+import time
+import egess_api
+
+
+def _demo_mode() -> bool:
+    return os.environ.get("DEMO_MODE", "0") == "1"
+
 
 def background_protocol(config_json, node_state, state_lock, this_port, number_of_nodes, push_queue):
-     """
-     Background protocol function. It is called with a certain frequency/period specified
-     in the all-nodes configuration.
+    state_lock.acquire()
+    try:
+        node_state["background_hits"] = int(node_state.get("background_hits", 0)) + 1
 
-     Args:
-          config_json (dict[str, Any]): JSON object with all-nodes configuration.
-          node_state (dict[str, Any]): The state of this current node.
-          state_lock (threading.Lock): The lock object for thread-safety of the state.
-          this_port (int): The port this node listens.
-          number_of_nodes (int): The total number of nodes in the network (if known).
-          push_queue (queue.Queue): The queue for messages to be pushed to other node(s).
-     """
-     state_lock.acquire() # Prevent state access by other threads
-     # Increment the number of background hits (invocations of this function) recorded
-     # in the node's state
-     node_state["background_hits"] = node_state["background_hits"] + 1
+        grid_size = int(node_state.get("grid_size", 8))
+        pos = node_state.get("grid_pos", [0, 0])
+        x = int(pos[0])
+        y = int(pos[1])
 
-     # ------------------------------------------------------------------
-     # Minimal "sensor reading" for an 8x8 map demo:
-     # - Nodes store grid_pos = [x, y] in node.py at startup
-     # - We generate a stable "hot" (RED) region in the center and BLUE outside
-     # ------------------------------------------------------------------
-     grid_size = node_state.get("grid_size", 8)
-     pos = node_state.get("grid_pos", [0, 0])
-     x = int(pos[0])
-     y = int(pos[1])
+        cx = (grid_size - 1) / 2.0
+        cy = (grid_size - 1) / 2.0
+        radius = 2.0
 
-     # Center blob parameters (tune radius if you want a bigger/smaller red core)
-     cx = (grid_size - 1) / 2.0
-     cy = (grid_size - 1) / 2.0
-     radius = 2.0
+        dist = math.sqrt((x - cx) ** 2 + (y - cy) ** 2)
+        reading = "RED" if dist <= radius else "BLUE"
 
-     dist = math.sqrt((x - cx) ** 2 + (y - cy) ** 2)
+        faults = node_state.get("faults", {})
+        if not isinstance(faults, dict):
+            faults = {}
+            node_state["faults"] = faults
 
-     # Local reading: BLUE outside, RED inside
-     if dist <= radius:
-          node_state["local_reading"] = "RED"
-     else:
-          node_state["local_reading"] = "BLUE"
-     # ------------------------------------------------------------------
+        # lie_sensor flips the physical observation.
+        if bool(faults.get("lie_sensor", False)):
+            reading = "BLUE" if reading == "RED" else "RED"
 
-     # Log current node state (the message will appear in run.log)
-     egess_api.log_current_node_state(this_port, node_state)
-     # Add the state change data point.
-     egess_api.write_state_change_data_point(this_port, node_state, "background_hits")
-     state_lock.release() # Allow state access by other threads
+        # flap toggles periodically to create controlled disagreement bursts.
+        if bool(faults.get("flap", False)):
+            period_sec = int(faults.get("period_sec", 4))
+            if period_sec < 1:
+                period_sec = 1
+            phase = int(time.time() // period_sec) % 2
+            if phase == 1:
+                reading = "BLUE" if reading == "RED" else "RED"
+
+        node_state["local_reading"] = reading
+
+        if not _demo_mode():
+            egess_api.log_current_node_state(this_port, node_state)
+            egess_api.write_state_change_data_point(this_port, node_state, "background_hits")
+
+    finally:
+        state_lock.release()

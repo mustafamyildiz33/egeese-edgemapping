@@ -14,116 +14,227 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
+import json
+import os
+import time
+import requests
 
-# -------------------------------------------------------------------------
-# This file provides a set of commonly used functions (the EGESS API),
-# which are likely to be used by several different modules of EGESS.
-# -------------------------------------------------------------------------
+RECENT_MSG_MAX = 60
 
-import json # For encoding/decoding JSON objects
-import time # For obtaining the timestamps
-import requests # For sending POST requests
+
+def _demo_mode() -> bool:
+    return os.environ.get("DEMO_MODE", "0") == "1"
+
+
+def _log_enabled() -> bool:
+    # In demo mode, default is OFF unless explicitly enabled.
+    if _demo_mode():
+        return os.environ.get("EGESS_LOG", "0") == "1"
+    return True
+
+
+def _data_path() -> str:
+    base = os.environ.get("EGESS_LOG_DIR", ".")
+    try:
+        os.makedirs(base, exist_ok=True)
+    except Exception:
+        pass
+    return os.path.join(base, "data.csv")
 
 
 def log_new_node_state(this_port, apriori_node_state, aposteriori_node_state):
-    """
-    Add to the log a record of a node state transition in a uniform format.
-
-    Args:
-        this_port (int): The port this node listens.
-        apriori_node_state (dict[str, Any]): The state of the node (JSON) before the transition.
-        aposteriori_node_state (dict[str, Any]): The state of the node (JSON) after the transition.
-    """
-    print("NODE STATE CHANGED (NODE {}):\nAPRIORI: {}\nAPOSTERIORI: {}\n"
-        .format(
-                this_port,
-                json.dumps(apriori_node_state),
-                json.dumps(aposteriori_node_state)
-            )
+    if not _log_enabled():
+        return
+    print(
+        "NODE STATE CHANGED (NODE {}):\nAPRIORI: {}\nAPOSTERIORI: {}\n".format(
+            this_port, json.dumps(apriori_node_state), json.dumps(aposteriori_node_state)
         )
+    )
 
 
 def log_current_node_state(this_port, node_state):
-    """
-    Add to the log a record of the current state of the node in a uniform format.
-
-    Args:
-        this_port (int): The port this node listens.
-        apriori_node_state (dict[str, Any]): The state of the node (JSON) before the transition.
-        aposteriori_node_state (dict[str, Any]): The state of the node (JSON) after the transition.
-    """
-    print("NODE STATE CHANGED (NODE {}):\nSTATE: {}\n"
-        .format(
-                this_port,
-                json.dumps(node_state)
-            )
+    if not _log_enabled():
+        return
+    print(
+        "NODE STATE (NODE {}):\nSTATE: {}\n".format(
+            this_port, json.dumps(node_state)
         )
+    )
 
 
 def write_data_point(this_port, logtype, message):
-    """
-    Write a data point to data.csv file with semicolon as a delimiter.
-
-    Args:
-        this_port (int): The port this node listens.
-        logtype (str): A unique key for specific type of log.
-        message (str): This is the data to be logged at the last column.
-    """
-    data_file = "data.csv" # The data is piled in data.csv. TODO: Make it custom (optionally)
-    with open(data_file, "a") as f: # Open the file in append mode
-        # Each record has four comma-separated fields:
-        # 1) the port that the node is listening, which is essentially the node's ID;
-        # 2) the current timestamp (in floating point format);
-        # 3) the unique type of the log, which allows to merge different datasets in one file;
-        # 4) the message (data point payload) - make sure to avoid commas in it.
-        f.write("{};{};{};{}\n".format(this_port, time.time(), logtype, message)) # Write into the file.
-        f.close() # Close the file.
+    if not _log_enabled():
+        return
+    data_file = _data_path()
+    with open(data_file, "a") as f:
+        f.write("{};{};{};{}\n".format(this_port, time.time(), logtype, message))
 
 
 def write_state_change_data_point(this_port, node_state, state_key):
-    """
-    Write a data point to data.csv file indicating the change of a state.
-    It is advised to use this function for each value changed in the state transition.
+    if not _log_enabled():
+        return
+    write_data_point(this_port, "state_change", "{}={}".format(state_key, node_state.get(state_key)))
 
-    Args:
-        this_port (int): The port this node listens.
-        node_state (dict[str, Any]): The state of this current node.
-        state_key (str): The state key which value has changed.
-    """    
-    write_data_point(this_port, "state_change", "{}={}".format(state_key, node_state[state_key]))
+
+def _ensure_msg_counters(node_state):
+    counters = node_state.get("msg_counters", {})
+    if not isinstance(counters, dict):
+        counters = {}
+    defaults = {
+        "pull_rx": 0,
+        "push_rx": 0,
+        "pull_tx": 0,
+        "push_tx": 0,
+        "tx_ok": 0,
+        "tx_fail": 0,
+        "tx_timeout": 0,
+        "tx_conn_error": 0,
+    }
+    for k, v in defaults.items():
+        try:
+            counters[k] = int(counters.get(k, v))
+        except Exception:
+            counters[k] = int(v)
+    node_state["msg_counters"] = counters
+    return counters
+
+
+def _append_recent_msg(node_state, message):
+    events = node_state.get("recent_msgs", [])
+    if not isinstance(events, list):
+        events = []
+    stamp = time.strftime("%H:%M:%S")
+    events.append("[{}] {}".format(stamp, str(message)))
+    if len(events) > RECENT_MSG_MAX:
+        events = events[-RECENT_MSG_MAX:]
+    node_state["recent_msgs"] = events
+
 
 def send_msg(config_json, node_state, state_lock, this_port, msg, target_port):
-    """
-    Send a POST request with JSON to the node with the specified port.
+    i = this_port - config_json["base_port"]
+    j = target_port - config_json["base_port"]
+    op = str(msg.get("op", "unknown"))
 
-    Args:
-        config_json (dict[str, Any]): JSON object with all-nodes configuration.
-        node_state (dict[str, Any]): The state of this current node.
-        state_lock (threading.Lock): The lock object for thread-safety of the state.
-        this_port (int): The port this node listens.
-        msg (dict[str, Any]): the JSON object to be sent.
-        target_port (int): the port (i.e., node ID) of the recipient node.
-    """
-    
-    # Apply the propagation delay as per the latency matrix
-    i = this_port - config_json["base_port"] # Convert port to row
-    j = target_port - config_json["base_port"] # Conver port to column
-    time.sleep(node_state["latency_matrix"][i][j]) # Apply latency
-    
+    state_lock.acquire()
     try:
-        host_url = "http://" + config_json["base_host"] # Form the URL of the host (without port)
-        # Send a POST request to the node with the target port
-        resp = requests.post("{}:{}/".format(host_url, target_port), json=msg)
+        counters = _ensure_msg_counters(node_state)
+        if op == "pull":
+            counters["pull_tx"] = int(counters.get("pull_tx", 0)) + 1
+        elif op == "push":
+            counters["push_tx"] = int(counters.get("push_tx", 0)) + 1
+        _append_recent_msg(node_state, "tx:{} -> {}".format(op, target_port))
+    finally:
+        state_lock.release()
 
-        if resp.status_code == 200: # If request is successful
-            resp_json = resp.json() # Obtain the JSON object fo the response
-            # And log it
-            print("send_msg: MESSAGE SENT ({} -> {}): {}; RESPONSE: {}\n".format(this_port, target_port, msg, resp_json))
-            # TODO: Consider return value
-        else: # The POST request wasn't successful
-            # Log the error
-            print("ERROR: send_msg: return code is not 200.\n")
-        
-    except requests.exceptions.ConnectionError: # Connection error
-        print("ERROR: send_msg: Connection error.\n") # Log the error
+    try:
+        time.sleep(node_state["latency_matrix"][i][j])
+    except Exception:
+        time.sleep(config_json.get("default_latency", 0.0))
 
+    try:
+        host_url = "http://" + config_json["base_host"]
+        resp = requests.post("{}:{}/".format(host_url, target_port), json=msg, timeout=0.75)
+
+        if resp.status_code == 200:
+            resp_json = None
+            try:
+                resp_json = resp.json()
+            except Exception:
+                resp_json = {
+                    "op": "receipt",
+                    "data": {
+                        "success": False,
+                        "message": "invalid_json_response"
+                    },
+                    "metadata": {}
+                }
+
+            if _log_enabled():
+                print(
+                    "send_msg: SENT ({} -> {}): {}; RESPONSE: {}\n".format(
+                        this_port, target_port, msg, resp_json
+                    )
+                )
+            state_lock.acquire()
+            try:
+                counters = _ensure_msg_counters(node_state)
+                counters["tx_ok"] = int(counters.get("tx_ok", 0)) + 1
+                _append_recent_msg(node_state, "tx_ok:{} -> {}".format(op, target_port))
+            finally:
+                state_lock.release()
+            return resp_json
+        else:
+            if _log_enabled():
+                print("ERROR: send_msg: return code is not 200.\n")
+            state_lock.acquire()
+            try:
+                counters = _ensure_msg_counters(node_state)
+                counters["tx_fail"] = int(counters.get("tx_fail", 0)) + 1
+                _append_recent_msg(node_state, "tx_fail:{} -> {} status={}".format(op, target_port, resp.status_code))
+            finally:
+                state_lock.release()
+            return {
+                "op": "receipt",
+                "data": {
+                    "success": False,
+                    "message": "http_status_{}".format(resp.status_code)
+                },
+                "metadata": {}
+            }
+
+    except requests.exceptions.ConnectionError:
+        if _log_enabled():
+            print("ERROR: send_msg: Connection error.\n")
+        state_lock.acquire()
+        try:
+            counters = _ensure_msg_counters(node_state)
+            counters["tx_conn_error"] = int(counters.get("tx_conn_error", 0)) + 1
+            counters["tx_fail"] = int(counters.get("tx_fail", 0)) + 1
+            _append_recent_msg(node_state, "tx_conn_error:{} -> {}".format(op, target_port))
+        finally:
+            state_lock.release()
+        return {
+            "op": "receipt",
+            "data": {
+                "success": False,
+                "message": "connection_error"
+            },
+            "metadata": {}
+        }
+    except requests.exceptions.Timeout:
+        if _log_enabled():
+            print("ERROR: send_msg: Timeout.\n")
+        state_lock.acquire()
+        try:
+            counters = _ensure_msg_counters(node_state)
+            counters["tx_timeout"] = int(counters.get("tx_timeout", 0)) + 1
+            counters["tx_fail"] = int(counters.get("tx_fail", 0)) + 1
+            _append_recent_msg(node_state, "tx_timeout:{} -> {}".format(op, target_port))
+        finally:
+            state_lock.release()
+        return {
+            "op": "receipt",
+            "data": {
+                "success": False,
+                "message": "timeout"
+            },
+            "metadata": {}
+        }
+    except Exception:
+        if _log_enabled():
+            print("ERROR: send_msg: Unknown error.\n")
+        state_lock.acquire()
+        try:
+            counters = _ensure_msg_counters(node_state)
+            counters["tx_fail"] = int(counters.get("tx_fail", 0)) + 1
+            _append_recent_msg(node_state, "tx_unknown_error:{} -> {}".format(op, target_port))
+        finally:
+            state_lock.release()
+        return {
+            "op": "receipt",
+            "data": {
+                "success": False,
+                "message": "unknown_error"
+            },
+            "metadata": {}
+        }

@@ -1,14 +1,51 @@
 {
-    "accepted_messages": 0,
-    "known_nodes": [],
-    "background_hits": 0,
+  "accepted_messages": 0,
+  "known_nodes": [],
+  "background_hits": 0,
 
-    "role": "normal",
-    "sensor_state": "NORMAL",
-    "emergency_mode": false,
+  "role": "normal",
 
-    "boundary_edges": [],
-    "missing_streak": {},
-    "last_seen": {},
-    "missing_reports": {}
+  "sensor_state": "NORMAL",
+  "emergency_mode": false,
+
+  "neighbors": [],
+
+  "dfa_state": "01",
+  "score": 0,
+  "score_bucket": "00",
+
+  "T_high": 4,
+  "T_low": 2,
+  "miss_timeout_sec": 3.0,
+  "miss_confirm_m": 3,
+
+  "last_verify_ts": 0,
+  "verify_cooldown_sec": 2.0,
+  "verify_backoff_mult": 1,
+
+  "neighbor_snapshots": {},
+  "missing_streak": {},
+  "last_seen": {},
+  "missing_confirmed": {},
+  "missing_reports": {},
+  "msg_counters": {
+    "pull_rx": 0,
+    "push_rx": 0,
+    "pull_tx": 0,
+    "push_tx": 0,
+    "tx_ok": 0,
+    "tx_fail": 0,
+    "tx_timeout": 0,
+    "tx_conn_error": 0
+  },
+  "recent_msgs": [],
+
+  "faults": {
+    "crash_sim": false,
+    "lie_sensor": false,
+    "flap": false,
+    "period_sec": 4
+  },
+
+  "boundary_edges": []
 }

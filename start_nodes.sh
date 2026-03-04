@@ -1,24 +1,43 @@
 #!/bin/bash
+set -e
 
-pkill -f node.py
+cd "$(dirname "$0")"
 
-mkdir -p backupdata
-mv data.csv backupdata/data-`date +%s`.csv 2>/dev/null
-touch data.csv
+BASE_PORT=9000
+TOTAL_NODES="${1:-36}"
 
-echo "" > run.log
-
-N=64
-PORT=9000
-
-PY="./.venv/bin/python"
-if [ ! -x "$PY" ]; then
-  PY="python3"
+if [[ -x ".venv/bin/python" ]]; then
+  PYTHON_BIN=".venv/bin/python"
+elif command -v python3 >/dev/null 2>&1; then
+  PYTHON_BIN="$(command -v python3)"
+elif command -v python >/dev/null 2>&1; then
+  PYTHON_BIN="$(command -v python)"
+else
+  echo "ERROR: No Python interpreter found (tried .venv/bin/python, python3, python)."
+  exit 1
 fi
 
-for ((i=1; i<=N; i++)); do
-    $PY -u node.py $PORT $N  >> run.log  2>&1 &
-    PORT=$((PORT + 1))
+STAMP="$(date +%Y%m%d_%H%M%S)"
+RUN_DIR="runs/$STAMP"
+mkdir -p "$RUN_DIR"
+PIDS_FILE="$RUN_DIR/pids.txt"
+: > "$PIDS_FILE"
+
+export DEMO_MODE=1
+export EGESS_LOG_DIR="$RUN_DIR"
+export EGESS_LOG="${EGESS_LOG:-0}"
+
+echo "Starting $TOTAL_NODES nodes (DEMO_MODE=1) ..."
+echo "Python: $PYTHON_BIN"
+echo "EGESS_LOG: $EGESS_LOG"
+echo "Run dir: $RUN_DIR"
+
+for ((i=0; i<TOTAL_NODES; i++)); do
+  PORT=$((BASE_PORT + i))
+  nohup "$PYTHON_BIN" -u node.py "$PORT" "$TOTAL_NODES" > "$RUN_DIR/node_${PORT}.log" 2>&1 < /dev/null &
+  echo "$!" >> "$PIDS_FILE"
 done
 
-ps -ef | grep node.py | grep -v grep
+echo "Started. Tip: tail -f $RUN_DIR/node_${BASE_PORT}.log"
+echo "PIDs: $PIDS_FILE"
+echo "$RUN_DIR" > "$RUN_DIR/LATEST_RUN_DIR.txt"

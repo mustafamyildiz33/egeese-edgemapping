@@ -1,12 +1,13 @@
 #!/bin/bash
+set -e
 
-# This script kills all the swarm notes running under the current
-# terminal. This script should print nothing. If it prints a process
-# running a node, it means that something went wrong with the killing.
+cd "$(dirname "$0")"
 
+LATEST_RUN="$(ls -1t runs 2>/dev/null | head -n 1 || true)"
+if [[ -n "$LATEST_RUN" && -f "runs/$LATEST_RUN/pids.txt" ]]; then
+  while IFS= read -r pid; do
+    kill "$pid" 2>/dev/null || true
+  done < "runs/$LATEST_RUN/pids.txt"
+fi
 
-# Kill all running nodes.
-pkill -f node.py
-
-# List the processes currently running nodes
-ps -ef | grep node.py | grep -v grep
+pkill -f "node.py [0-9][0-9]* [0-9][0-9]*" 2>/dev/null || true

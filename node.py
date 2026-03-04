@@ -1,3 +1,4 @@
+
 # EGESS - Experimental Gear for Evaluation of Swarm Systems
 # Copyright (C) 2026  Nick Ivanov and ACSUS Lab <ivanov@rowan.edu>
 
@@ -21,129 +22,93 @@
 # -------------------------------------------------------------------------
 
 # LIBRARY IMPORTS
-import sys  # To access command line arguments
-import json # To encode and decode JSON format
-from flask import Flask, request, jsonify # For sending and receiving messages
-import threading # For running push, background, listener, and pull threads
-import queue # For implementing the push queue
-import time # For sleep, to make sure that background is not too active
-
+import sys
+import json
+from flask import Flask, request, jsonify
+import threading
+import queue
+import time
 
 # LOCAL IMPORTS
-import push_protocol # Contains the pull protocol of the node
-import background_protocol # Contains the background protocol of the node
-import listener_protocol # Contains the listener protocol of the node
-import pull_protocol # Contains the pull protocol of the node
+import push_protocol
+import background_protocol
+import listener_protocol
+import pull_protocol
 
 
 def pull(config_json, node_state, state_lock, this_port, number_of_nodes, push_queue):
-    """
-    Thread function that initiates the pull protocol of the node.
-
-    Args:
-        config_json (dict[str, Any]): JSON object with all-nodes configuration.
-        node_state (dict[str, Any]): The state of this current node.
-        state_lock (threading.Lock): The lock object for thread-safety of the state.
-        this_port (int): The port this node listens.
-        number_of_nodes (int): The total number of nodes in the network (if known).
-        push_queue (queue.Queue): The queue for messages to be pushed to other node(s).
-    """
     while True:
-        time.sleep(config_json["pull_period"]) # Keep invoking the pull protocol with pre-determined frequency
+        time.sleep(config_json["pull_period"])
         pull_protocol.pull_protocol(config_json, node_state, state_lock, this_port, number_of_nodes, push_queue)
 
 
 def push(config_json, node_state, state_lock, this_port, number_of_nodes, push_queue):
-    """
-    Thread function that initiates the push protocol of the node.
-
-    Args:
-        config_json (dict[str, Any]): JSON object with all-nodes configuration.
-        node_state (dict[str, Any]): The state of this current node.
-        state_lock (threading.Lock): The lock object for thread-safety of the state.
-        this_port (int): The port this node listens.
-        number_of_nodes (int): The total number of nodes in the network (if known).
-        push_queue (queue.Queue): The queue for messages to be pushed to other node(s).
-    """
     while True:
-        msg = push_queue.get() # Get the next message from the push queue
-        # ... and immediately invoke the push protocol for this message.
+        msg = push_queue.get()
         push_protocol.push_protocol(config_json, node_state, state_lock, this_port, number_of_nodes, push_queue, msg)
 
 
 def listener(config_json, node_state, state_lock, this_port, number_of_nodes, push_queue):
-    """
-    Thread function that initiates the listener protocol of the node.
+    app = Flask(__name__)
 
-    Args:
-        config_json (dict[str, Any]): JSON object with all-nodes configuration.
-        node_state (dict[str, Any]): The state of this current node.
-        state_lock (threading.Lock): The lock object for thread-safety of the state.
-        this_port (int): The port this node listens.
-        number_of_nodes (int): The total number of nodes in the network (if known).
-        push_queue (queue.Queue): The queue for messages to be pushed to other node(s).
-    """
-    app = Flask(__name__) # Create an app
-
-    @app.route("/", methods=['POST']) # Listen to POST request to the default endpoint
+    @app.route("/", methods=['POST'])
     def egess_api():
-        if not request.is_json: # Make sure the message is in JSON format. TODO: Check for specific fields.
+        if not request.is_json:
             return jsonify({"error": "OOPS: Not JSON!"}), 400
-        else:
-            msg = request.get_json() # The message is a legitimate JSON object
-            # Invoke the listener protocol for this message
-            return listener_protocol.listener_protocol(config_json, node_state, state_lock, this_port, number_of_nodes, push_queue, msg)
+        msg = request.get_json()
+        return listener_protocol.listener_protocol(config_json, node_state, state_lock, this_port, number_of_nodes, push_queue, msg)
 
     app.run(host=config_json["base_host"], port=this_port)
 
 
 def background(config_json, node_state, state_lock, this_port, number_of_nodes, push_queue):
-    """
-    Thread function that initiates the background protocol of the node.
-
-    Args:
-        config_json (dict[str, Any]): JSON object with all-nodes configuration.
-        node_state (dict[str, Any]): The state of this current node.
-        state_lock (threading.Lock): The lock object for thread-safety of the state.
-        this_port (int): The port this node listens.
-        number_of_nodes (int): The total number of nodes in the network (if known).
-        push_queue (queue.Queue): The queue for messages to be pushed to other node(s).
-    """
     while True:
-        time.sleep(config_json["background_period"]) # Keep invoking the background protocol with pre-determined frequency
+        time.sleep(config_json["background_period"])
         background_protocol.background_protocol(config_json, node_state, state_lock, this_port, number_of_nodes, push_queue)
 
 
+def _hex_neighbors_odd_r(col, row, grid):
+    out = []
+    if row % 2 == 0:
+        candidates = [
+            (col - 1, row), (col + 1, row),
+            (col, row - 1), (col - 1, row - 1),
+            (col, row + 1), (col - 1, row + 1),
+        ]
+    else:
+        candidates = [
+            (col - 1, row), (col + 1, row),
+            (col + 1, row - 1), (col, row - 1),
+            (col + 1, row + 1), (col, row + 1),
+        ]
+    for c, r in candidates:
+        if 0 <= c < grid and 0 <= r < grid:
+            out.append((c, r))
+    return out
+
+
 def main():
-    # The program accepts exactly two argumens:
-    # 1) port that the node will listen;
-    # 2) the total number of nodes in the network.
     if len(sys.argv) != 3:
         print("ERROR Two arguments expected.")
         print("USAGE: {} <port> <number_of_nodes>".format(sys.argv[0]))
         exit(1)
 
-    config_file = "config.json" # This file has the configuration that applies to all nodes.
-    node_state_init_file = "node_state_init.json" # This is the initial "seed" state that each node is initialized with.
+    config_file = "config.json"
+    node_state_init_file = "node_state_init.json"
 
-    this_port = int(sys.argv[1]) # Read from the command line argument the port number to listen.
-    number_of_nodes = int(sys.argv[2]) # Read from the command line the total number of nodes.
+    this_port = int(sys.argv[1])
+    number_of_nodes = int(sys.argv[2])
 
-    with open(config_file) as file: # Read all-nodes configuration file
-        config_json = json.load(file) # Convert into JSON object. ATTENTION: this object is not for writing (for thread safety)
+    with open(config_file) as file:
+        config_json = json.load(file)
 
-    with open(node_state_init_file) as file: # Real the initial state for all nodes
-        node_state = json.load(file) # Convert into JSON object. ATTENTION: this object can only be used with a state lock
+    with open(node_state_init_file) as file:
+        node_state = json.load(file)
 
-    # -------------------------------------------------------------------------
-    # Minimal 8x8 grid metadata for "map" visualization:
-    # - Each node gets a fixed grid position based on its port
-    # - Border nodes are marked as "sentinel" (low-energy watchers)
-    # - local_reading is updated in background_protocol.py
-    # -------------------------------------------------------------------------
-    grid_size = 8
-    base_port = config_json.get("base_port", 9000)
-    idx = this_port - int(base_port)
+    grid_size = int(node_state.get("grid_size", 8))
+    base_port = int(config_json.get("base_port", 9000))
+
+    idx = this_port - base_port
     gx = int(idx % grid_size)
     gy = int(idx // grid_size)
 
@@ -153,70 +118,47 @@ def main():
     if gx == 0 or gx == grid_size - 1 or gy == 0 or gy == grid_size - 1:
         node_state["role"] = "sentinel"
     else:
-        node_state["role"] = "normal"
+        node_state["role"] = node_state.get("role", "normal")
 
-    # Default until background updates it
+    nbrs = []
+    for (nc, nr) in _hex_neighbors_odd_r(gx, gy, grid_size):
+        nidx = nr * grid_size + nc
+        nport = base_port + nidx
+        if base_port <= nport < base_port + number_of_nodes and nport != this_port:
+            nbrs.append(int(nport))
+    node_state["neighbors"] = sorted(list(set(nbrs)))
+
     node_state.setdefault("local_reading", "BLUE")
-    # -------------------------------------------------------------------------
+    node_state.setdefault("sensor_state", "NORMAL")
 
-    # Add a latency matrix to the initial state
-    # Latency matrix represents latency in seconds between a pair of nodes
-    # As the nodes change their configuration (e.g., physically move), the
-    # latency matrix can dynamically change to represent this.
     node_state["latency_matrix"] = []
-
-    # Initialize the latency matrix with the default initial value
     for i in range(number_of_nodes):
         row = []
         for j in range(number_of_nodes):
             row.append(config_json["default_latency"])
-            node_state["latency_matrix"].append(row)
+        node_state["latency_matrix"].append(row)
 
-    # State lock for thread safety of the node_state object.
-    # ATTENTION: Never read or write from/to the node_state object before acquiring the state_lock first
-    # ATTENTION: Make sure that the state_lock object is released right after accessing the node_state object
-    #               ("accessing" may mean an atomic sequence of read-writes).
     state_lock = threading.Lock()
 
-    # Create a push queue object. Each time we want to propagate/push/forward a message, we should use this queue.
-    # The maximal size of the queue is specified in the all-nodes configuration file.
     push_queue = queue.Queue(maxsize=config_json["push_queue_maxsize"])
-    # The push thread enqueues the message from the push queue in a thread-safe manner and executes the push protocol
-    # to decide which nodes to send this message to.
+
     push_thread = threading.Thread(target=push, args=(config_json, node_state, state_lock, this_port, number_of_nodes, push_queue))
-    # The push thread must start first to make sure that if any other thread enqueues something in the push queue, the receiving
-    # side of the queue is ready. The push thread will not start "doing" anything disruptive before the push queue has at
-    # least one message, so it is safe to start it first.
     push_thread.start()
 
-
-    # Create the background thread. The background thread changes the state of the current node on its own schedule.
-    # It is not directly invoked or controlled by incoming message or any queue. Essentially, it is only controlled by
-    # the progression of time or other local characteristics (such as local sensor readings). For instance, if the current
-    # node is a UAV (drone), then it would be the background thread that updates the state of the node to reflect the
-    # current GPS coordinates and altitude of the drone.
     background_thread = threading.Thread(target=background, args=(config_json, node_state, state_lock, this_port, number_of_nodes, push_queue))
-    # The background thread must start before the listener and pull threads to ensure the accuracy of the node's state
     background_thread.start()
 
-    # Create a pull thread. This thread opens up the port, listens for the incoming messages, checks if the messages
-    # are in JSON format, and then passes them to the listener protocol function for further processing.
     listener_thread = threading.Thread(target=listener, args=(config_json, node_state, state_lock, this_port, number_of_nodes, push_queue))
-    # Start listener thread
     listener_thread.start()
 
-    # Create the pull thread. The pull thread contacts (polls) other nodes to get some information or updates from them.
     pull_thread = threading.Thread(target=pull, args=(config_json, node_state, state_lock, this_port, number_of_nodes, push_queue))
-    pull_thread.start() # Start the pull thread.
+    pull_thread.start()
 
-    # Join the threads in the opposite (LIFO) order
     pull_thread.join()
     listener_thread.join()
     background_thread.join()
     push_thread.join()
 
 
-# This code prevents running the initialization code if this file is imported by another module
-# More information here: https://docs.python.org/3/library/__main__.html
 if __name__ == "__main__":
     main()

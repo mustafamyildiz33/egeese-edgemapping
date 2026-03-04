@@ -22,7 +22,6 @@
 
 import sys # For reading command-line arguments
 import json # For encoding/decoding JSON format
-import requests # For sending a message via POST protocol
 
 def main():
 
@@ -46,6 +45,13 @@ def main():
     with open(trigger_msg_json_file) as file:
         trigger_msg = json.load(file) # Read the message to-be sent into the trigger_msg JSON object
 
+    try:
+        import requests # For sending a message via POST protocol
+    except ModuleNotFoundError:
+        print("ERROR: Python package 'requests' is not installed in this interpreter.")
+        print("TIP: Use './.venv/bin/python trigger.py ...' or install dependencies in your active Python.")
+        exit(1)
+
     try: # Send the POST request to the node.
         resp = requests.post("http://{}:{}/".format(config_json["base_host"], node_port), json=trigger_msg)
 
@@ -54,7 +60,14 @@ def main():
             resp_json = resp.json()
             print("RESPONSE: ", json.dumps(resp_json, indent=4))
         else:
-            print("ERROR RESPONSE: ", json.dumps(resp_json, indent=4))
+            try:
+                err_json = resp.json()
+            except Exception:
+                err_json = {
+                    "status_code": resp.status_code,
+                    "text": resp.text
+                }
+            print("ERROR RESPONSE: ", json.dumps(err_json, indent=4))
     except requests.exceptions.ConnectionError: # If a connection error occurs
         print("ERROR: Connection error.")
 
