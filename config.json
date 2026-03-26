@@ -1,5 +1,5 @@
 {
-  "version": 3,
+  "version": 4,
   "base_host": "127.0.0.1",
   "base_port": 9000,
 
@@ -7,23 +7,26 @@
 
   "push_queue_maxsize": 5000,
 
-  "background_period": 2,
+  "background_period": 1,
   "pull_period": 2,
+  "startup_grace_sec": 4,
 
   "default_latency": 0.05,
 
-  "missing_debounce_m": 3,
-
-  "T_high": 4,
+  "T_high": 8,
   "T_low": 2,
 
-  "verify_jitter_max_ticks": 2,
-  "verify_cooldown_base_ticks": 8,
-  "verify_cooldown_max_ticks": 80,
+  "front_watch_threshold": 3.0,
+  "front_warning_threshold": 5.0,
+  "impact_threshold": 4.0,
+  "coherence_gate": 2,
+  "stall_cycles": 3,
+  "contained_cycles": 5,
+  "fresh_event_window_sec": 4.5,
+  "manual_alert_impact_bonus": 2.0,
 
   "push_neighbor_fanout": 2,
-
-  "alert_ttl": 8,
   "alert_fanout": 2,
+  "notice_fanout": 2,
   "max_forwards": 8
 }

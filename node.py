@@ -24,6 +24,8 @@
 # LIBRARY IMPORTS
 import sys
 import json
+import os
+import math
 from flask import Flask, request, jsonify
 import threading
 import queue
@@ -87,6 +89,16 @@ def _hex_neighbors_odd_r(col, row, grid):
     return out
 
 
+def _auto_grid_size(number_of_nodes):
+    root = int(math.isqrt(int(number_of_nodes)))
+    if root > 0 and root * root == int(number_of_nodes):
+        return int(root)
+    root = int(math.ceil(math.sqrt(float(number_of_nodes))))
+    if root < 2:
+        root = 2
+    return int(root)
+
+
 def main():
     if len(sys.argv) != 3:
         print("ERROR Two arguments expected.")
@@ -105,7 +117,15 @@ def main():
     with open(node_state_init_file) as file:
         node_state = json.load(file)
 
-    grid_size = int(node_state.get("grid_size", 8))
+    env_grid = os.environ.get("EGESS_GRID_SIZE", "").strip()
+    if env_grid.isdigit() and int(env_grid) >= 2:
+        grid_size = int(env_grid)
+    else:
+        # Prefer an auto-fit square grid when possible (e.g., 36 -> 6x6).
+        grid_size = int(node_state.get("grid_size", int(config_json.get("grid_size", _auto_grid_size(number_of_nodes)))))
+        if grid_size * grid_size < int(number_of_nodes):
+            grid_size = _auto_grid_size(number_of_nodes)
+
     base_port = int(config_json.get("base_port", 9000))
 
     idx = this_port - base_port
@@ -114,6 +134,7 @@ def main():
 
     node_state["grid_size"] = grid_size
     node_state["grid_pos"] = [gx, gy]
+    node_state["started_ts"] = float(time.time())
 
     if gx == 0 or gx == grid_size - 1 or gy == 0 or gy == grid_size - 1:
         node_state["role"] = "sentinel"
@@ -130,6 +151,42 @@ def main():
 
     node_state.setdefault("local_reading", "BLUE")
     node_state.setdefault("sensor_state", "NORMAL")
+    node_state["T_high"] = float(config_json.get("T_high", float(node_state.get("T_high", 7))))
+    node_state["T_low"] = float(config_json.get("T_low", float(node_state.get("T_low", 2))))
+    node_state.setdefault("protocol_state", "NORMAL")
+    node_state.setdefault("score", 0.0)
+    node_state.setdefault("raw_score", 0.0)
+    node_state.setdefault("score_delta", 0.0)
+    node_state.setdefault("score_trend", "steady (0)")
+    node_state.setdefault("score_bucket", 0)
+    node_state.setdefault("front_score", 0.0)
+    node_state.setdefault("impact_score", 0.0)
+    node_state.setdefault("arrest_score", 0.0)
+    node_state.setdefault("coherence_score", 0)
+    node_state.setdefault("front_score_by_sector", {})
+    node_state.setdefault("front_components", {})
+    node_state.setdefault("impact_components", {})
+    node_state.setdefault("arrest_components", {})
+    node_state.setdefault("coherence_components", {})
+    node_state.setdefault("dominant_sector", 0)
+    node_state.setdefault("dominant_sector_history", [])
+    node_state.setdefault("active_sectors", [])
+    node_state.setdefault("front_width", 0)
+    node_state.setdefault("no_progress_cycles", 0)
+    node_state.setdefault("neighbor_states", {})
+    node_state.setdefault("neighbor_miss_streak", {})
+    node_state.setdefault("current_missing_neighbors", [])
+    node_state.setdefault("new_missing_neighbors", [])
+    node_state.setdefault("persistent_missing_neighbors", [])
+    node_state.setdefault("recovered_neighbors", [])
+    node_state.setdefault("incoming_events", [])
+    node_state.setdefault("seen_event_ids", [])
+    node_state.setdefault("recent_alerts", [])
+    node_state.setdefault("last_cycle_ts", 0.0)
+    node_state.setdefault("last_state_change_ts", 0.0)
+    node_state.setdefault("pull_cycles", 0)
+    node_state.setdefault("event_seq", 0)
+    node_state.setdefault("boundary_kind", "stable")
 
     node_state["latency_matrix"] = []
     for i in range(number_of_nodes):

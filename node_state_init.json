@@ -6,28 +6,53 @@
   "role": "normal",
 
   "sensor_state": "NORMAL",
+  "local_reading": "BLUE",
   "emergency_mode": false,
 
   "neighbors": [],
 
-  "dfa_state": "01",
-  "score": 0,
-  "score_bucket": "00",
+  "protocol_state": "NORMAL",
+  "score": 0.0,
+  "raw_score": 0.0,
+  "score_bucket": 0,
+  "score_delta": 0.0,
+  "score_trend": "steady (0)",
 
-  "T_high": 4,
+  "T_high": 8,
   "T_low": 2,
-  "miss_timeout_sec": 3.0,
-  "miss_confirm_m": 3,
 
-  "last_verify_ts": 0,
-  "verify_cooldown_sec": 2.0,
-  "verify_backoff_mult": 1,
+  "front_score": 0.0,
+  "impact_score": 0.0,
+  "arrest_score": 0.0,
+  "coherence_score": 0,
+  "front_score_by_sector": {},
+  "front_components": {},
+  "impact_components": {},
+  "arrest_components": {},
+  "coherence_components": {},
 
-  "neighbor_snapshots": {},
-  "missing_streak": {},
-  "last_seen": {},
-  "missing_confirmed": {},
-  "missing_reports": {},
+  "dominant_sector": 0,
+  "dominant_sector_history": [],
+  "active_sectors": [],
+  "front_width": 0,
+  "no_progress_cycles": 0,
+
+  "neighbor_states": {},
+  "neighbor_miss_streak": {},
+  "current_missing_neighbors": [],
+  "new_missing_neighbors": [],
+  "persistent_missing_neighbors": [],
+  "recovered_neighbors": [],
+
+  "incoming_events": [],
+  "seen_event_ids": [],
+  "recent_alerts": [],
+
+  "last_cycle_ts": 0.0,
+  "last_state_change_ts": 0.0,
+  "pull_cycles": 0,
+  "event_seq": 0,
+
   "msg_counters": {
     "pull_rx": 0,
     "push_rx": 0,
@@ -45,7 +70,5 @@
     "lie_sensor": false,
     "flap": false,
     "period_sec": 4
-  },
-
-  "boundary_edges": []
+  }
 }

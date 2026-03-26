@@ -22,14 +22,23 @@ RUN_DIR="runs/$STAMP"
 mkdir -p "$RUN_DIR"
 PIDS_FILE="$RUN_DIR/pids.txt"
 : > "$PIDS_FILE"
+touch "$RUN_DIR/data.csv"
+ln -sf "$RUN_DIR/data.csv" data.csv
+
+GRID_SIDE=1
+while (( GRID_SIDE * GRID_SIDE < TOTAL_NODES )); do
+  GRID_SIDE=$((GRID_SIDE + 1))
+done
 
 export DEMO_MODE=1
 export EGESS_LOG_DIR="$RUN_DIR"
 export EGESS_LOG="${EGESS_LOG:-0}"
+export EGESS_GRID_SIZE="${EGESS_GRID_SIZE:-$GRID_SIDE}"
 
 echo "Starting $TOTAL_NODES nodes (DEMO_MODE=1) ..."
 echo "Python: $PYTHON_BIN"
 echo "EGESS_LOG: $EGESS_LOG"
+echo "EGESS_GRID_SIZE: $EGESS_GRID_SIZE"
 echo "Run dir: $RUN_DIR"
 
 for ((i=0; i<TOTAL_NODES; i++)); do

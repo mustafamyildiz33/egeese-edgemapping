@@ -1,0 +1,110 @@
+#!/bin/bash
+set -euo pipefail
+
+cd "$(dirname "$0")"
+
+NODES=16
+GRID=""
+AUTO_DEMO="off"
+AUTO_PERIOD=10
+STOP_ON_EXIT=1
+RUN_VISUALIZER=1
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --nodes)
+      NODES="$2"
+      shift 2
+      ;;
+    --grid)
+      GRID="$2"
+      shift 2
+      ;;
+    --auto-demo)
+      AUTO_DEMO="$2"
+      shift 2
+      ;;
+    --auto-period)
+      AUTO_PERIOD="$2"
+      shift 2
+      ;;
+    --no-stop-on-exit)
+      STOP_ON_EXIT=0
+      shift
+      ;;
+    --no-visualizer)
+      RUN_VISUALIZER=0
+      shift
+      ;;
+    *)
+      echo "Unknown argument: $1"
+      echo "Usage: ./startnodes [--nodes N] [--grid G] [--auto-demo off|firebomb|spread|tornado|dual] [--auto-period SEC] [--no-stop-on-exit] [--no-visualizer]"
+      exit 1
+      ;;
+  esac
+done
+
+if ! [[ "$NODES" =~ ^[0-9]+$ ]] || [[ "$NODES" -lt 2 ]]; then
+  echo "ERROR: --nodes must be an integer >= 2"
+  exit 1
+fi
+
+if [[ -z "$GRID" ]]; then
+  g=1
+  while (( g * g < NODES )); do
+    ((g++))
+  done
+  if (( g * g == NODES )); then
+    GRID="$g"
+  else
+    GRID=8
+  fi
+fi
+
+if ! [[ "$GRID" =~ ^[0-9]+$ ]] || [[ "$GRID" -lt 2 ]]; then
+  echo "ERROR: --grid must be an integer >= 2"
+  exit 1
+fi
+
+if [[ "$RUN_VISUALIZER" -eq 1 ]]; then
+  if [[ ! -x ".venv/bin/python" ]]; then
+    echo "ERROR: .venv/bin/python not found. Create venv first."
+    exit 1
+  fi
+fi
+
+# In no-visualizer mode, default behavior should keep nodes running.
+if [[ "$RUN_VISUALIZER" -eq 0 ]] && [[ "$STOP_ON_EXIT" -eq 1 ]]; then
+  STOP_ON_EXIT=0
+fi
+
+cleanup() {
+  if [[ "$STOP_ON_EXIT" -eq 1 ]]; then
+    ./stop_nodes.sh >/dev/null 2>&1 || true
+  fi
+}
+
+if [[ "$STOP_ON_EXIT" -eq 1 ]]; then
+  trap cleanup EXIT INT TERM
+fi
+
+echo "Starting nodes (N=$NODES, GRID=$GRID, EGESS_LOG=1)..."
+EGESS_LOG=1 ./start_nodes.sh "$NODES"
+
+RUN_DIR="$(ls -1dt runs/* | head -n 1)"
+echo "Run dir: $RUN_DIR"
+echo "Log tail tip: tail -f $RUN_DIR/node_9000.log"
+
+if [[ "$RUN_VISUALIZER" -eq 0 ]]; then
+  echo "Visualizer disabled (--no-visualizer). Nodes are running."
+  echo "Stop with: ./stopnodes"
+  exit 0
+fi
+
+echo "Launching visualizer (auto-demo=$AUTO_DEMO, period=${AUTO_PERIOD}s)..."
+./.venv/bin/python visualize_mapping.py \
+  --base-port 9000 \
+  --n "$NODES" \
+  --grid "$GRID" \
+  --auto-demo "$AUTO_DEMO" \
+  --auto-period "$AUTO_PERIOD"

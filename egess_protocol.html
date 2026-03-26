@@ -1,0 +1,417 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>EGESS — Protocol Overview</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Source+Code+Pro:wght@400;600;700&family=Source+Serif+4:ital,wght@0,400;0,600;0,700;1,400&display=swap');
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Source Serif 4', Georgia, serif; color: #1a1a1a; background: #FDFDFD; line-height: 1.65; max-width: 960px; margin: 0 auto; padding: 40px 24px 80px; }
+  h1 { font-size: 28px; font-weight: 700; margin-bottom: 4px; }
+  h2 { font-size: 18px; font-weight: 700; margin: 36px 0 12px; padding-bottom: 6px; border-bottom: 2px solid #222; }
+  h3 { font-size: 14px; font-weight: 700; margin: 20px 0 8px; color: #333; }
+  p { margin: 8px 0; font-size: 14px; }
+  .subtitle { color: #666; font-size: 13px; margin-bottom: 24px; }
+  .tag { display: inline-block; font-size: 9px; font-family: 'Source Code Pro', monospace; padding: 1px 6px; border-radius: 3px; margin-left: 8px; vertical-align: middle; }
+  .tag-original { background: #E3F2FD; color: #1565C0; border: 1px solid #90CAF9; }
+  .tag-improved { background: #FFF3E0; color: #E65100; border: 1px solid #FFCC80; }
+  .tag-new { background: #E8F5E9; color: #2E7D32; border: 1px solid #A5D6A7; }
+  code { font-family: 'Source Code Pro', monospace; font-size: 12px; background: #f4f4f4; padding: 2px 6px; border-radius: 3px; border: 1px solid #e8e8e8; }
+  pre { font-family: 'Source Code Pro', monospace; font-size: 12px; background: #1a1a1a; color: #e0e0e0; padding: 14px 18px; border-radius: 4px; margin: 10px 0; overflow-x: auto; line-height: 1.6; position: relative; }
+  pre .cmt { color: #6a9955; }
+  .cbtn { position: absolute; top: 8px; right: 8px; background: #333; color: #ccc; border: 1px solid #555; padding: 3px 10px; font-size: 10px; font-family: 'Source Code Pro', monospace; border-radius: 3px; cursor: pointer; }
+  .cbtn:hover { background: #444; color: #fff; }
+  .formula-box { background: #fff; border: 1px solid #ddd; border-left: 4px solid #4682B4; padding: 14px 18px; margin: 12px 0; border-radius: 3px; font-family: 'Source Code Pro', monospace; font-size: 13px; line-height: 1.8; }
+  .formula-box .label { font-weight: 700; font-size: 14px; margin-bottom: 4px; font-family: 'Source Serif 4', Georgia, serif; }
+  .formula-box .hint { font-size: 11px; color: #666; font-style: italic; font-family: 'Source Serif 4', Georgia, serif; margin-top: 4px; }
+  .state-row { display: flex; align-items: center; gap: 10px; padding: 6px 0; border-bottom: 1px solid #f0f0f0; }
+  .state-dot { width: 14px; height: 14px; border-radius: 2px; border: 1px solid #333; flex-shrink: 0; }
+  .state-label { font-family: 'Source Code Pro', monospace; font-weight: 700; font-size: 13px; min-width: 100px; }
+  .state-thresh { font-family: 'Source Code Pro', monospace; font-size: 12px; color: #666; min-width: 60px; }
+  .weight-table { width: 100%; border-collapse: collapse; font-family: 'Source Code Pro', monospace; font-size: 12px; margin: 12px 0; }
+  .weight-table th { background: #f8f8f8; padding: 6px 10px; text-align: left; border-bottom: 2px solid #333; font-size: 11px; }
+  .weight-table td { padding: 5px 10px; border-bottom: 1px solid #eee; }
+  .weight-table .w { font-weight: 700; text-align: center; min-width: 40px; }
+  .weight-table .pos { color: #CD3333; }
+  .weight-table .neg { color: #3CB371; }
+  .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin: 12px 0; }
+  .card { background: #fff; border: 1px solid #ddd; padding: 14px 16px; border-radius: 3px; }
+  .card h4 { font-size: 13px; font-weight: 700; margin-bottom: 6px; font-family: 'Source Code Pro', monospace; }
+  .card p { font-size: 12px; color: #555; margin: 4px 0; }
+  .flow-arrow { font-family: 'Source Code Pro', monospace; font-size: 13px; color: #666; text-align: center; margin: 4px 0; }
+  .section-divider { margin: 40px 0 20px; border-top: 3px solid #333; padding-top: 8px; }
+  .section-divider span { font-size: 11px; color: #999; font-family: 'Source Code Pro', monospace; text-transform: uppercase; letter-spacing: 1px; }
+  @media (max-width: 700px) { .two-col { grid-template-columns: 1fr; } }
+</style>
+<script>
+function cc(btn) {
+  const pre = btn.parentElement;
+  const text = pre.innerText.replace('Copy', '').trim();
+  navigator.clipboard.writeText(text);
+  btn.textContent = 'Copied!';
+  setTimeout(() => btn.textContent = 'Copy', 1500);
+}
+</script>
+</head>
+<body>
+
+<h1>EGESS</h1>
+<p class="subtitle">Experimental Gear for Evaluation of Swarm Systems — Protocol Overview</p>
+
+<!-- ═══════════════════════════════════════════ -->
+<h2>1. Core Idea</h2>
+<p>Every node periodically <strong>pulls</strong> its 6 hex neighbors with a small "are you there?" message. If a neighbor doesn't respond, it's <strong>missing</strong>. If a neighbor responds but reports much higher danger, that's <strong>disagreement</strong>.</p>
+<p>The key insight: <strong>node unavailability itself is the sensing signal.</strong> By looking at which neighbors disappear, in what order, and whether the pattern continues or stalls, a node infers hazard approach, impact, containment, and recovery — without any environmental sensors.</p>
+
+<!-- ═══════════════════════════════════════════ -->
+<h2>2. What Each Pull Cycle Collects</h2>
+<table class="weight-table">
+  <tr><th>Signal</th><th>Meaning</th><th>How Detected</th></tr>
+  <tr><td><strong>New missing</strong></td><td>Neighbor just went offline this cycle</td><td>Was alive last cycle, pull failed now</td></tr>
+  <tr><td><strong>Persistent missing</strong></td><td>Was already gone and still is</td><td>Was missing last cycle, still missing</td></tr>
+  <tr><td><strong>Recovered</strong></td><td>Was gone but came back</td><td>Was missing, pull succeeds now</td></tr>
+  <tr><td><strong>Disagreement</strong></td><td>Neighbor sees higher danger than me</td><td>Neighbor T ≥ 3 and T &gt; myT + 1 (capped at 2)</td></tr>
+</table>
+
+<!-- ═══════════════════════════════════════════ -->
+<h2>3. Three Sub-Scores</h2>
+<p>Each node computes three scores from the same pull data. Each answers a different question:</p>
+
+<div class="formula-box" style="border-left-color: #DAA520;">
+  <div class="label">FrontScore — "Is the hazard heading toward me?"</div>
+  <div>= 2 × newMissing + 1 × disagree + 0.5 × persistMissing + momentum</div>
+  <div class="hint">High when NEW neighbors disappear. Detects the approaching front. Disagreement capped at 2 max so it can't cascade across the whole grid.</div>
+</div>
+
+<div class="formula-box" style="border-left-color: #CD3333;">
+  <div class="label">ImpactScore — "How much damage is around me right now?"</div>
+  <div>= 3 × totalMissing + 2 × clusterBonus</div>
+  <div class="hint">Counts ALL missing neighbors. ClusterBonus = 1 if missing nodes are next to each other (structured hazard, not random).</div>
+</div>
+
+<div class="formula-box" style="border-left-color: #8B668B;">
+  <div class="label">ArrestScore — "Has the hazard stopped spreading?"</div>
+  <div>= stall + retreat − bypass</div>
+  <div class="hint">Stall = no new missing 3+ cycles. Retreat = neighbors recovering. Bypass = new damage in side direction. Positive = front stopped.</div>
+</div>
+
+<!-- ═══════════════════════════════════════════ -->
+<h2>4. T Score</h2>
+<div class="formula-box">
+  <div class="label">T = max(FrontScore, ImpactScore)</div>
+  <div class="hint">One number: "how bad is it?" Whichever sub-score is higher wins.</div>
+</div>
+<table class="weight-table">
+  <tr><th>Modifier</th><th class="w">Value</th><th>When</th></tr>
+  <tr><td>Momentum</td><td class="w pos">+2</td><td>T was &gt; 0 last cycle AND still getting signal</td></tr>
+  <tr><td>Decay</td><td class="w neg">−1</td><td>No signal this cycle — T drops by 1 until 0</td></tr>
+</table>
+
+<!-- ═══════════════════════════════════════════ -->
+<h2>5. Slope — "Is it getting worse or better?" <span class="tag tag-improved">improved</span></h2>
+<div class="formula-box" style="border-left-color: #CD6600;">
+  <div class="label">Slope = (T_now − T_oldest) / (window − 1)</div>
+  <div>Over last 4 T values. Example: [0, 2, 5, 9] → slope = +3.0/cycle</div>
+  <div class="hint">T is a snapshot. Slope is the trend. Two nodes at T=3 can be in opposite situations: one approaching (slope +2), one recovering (slope −1).</div>
+</div>
+<p>Slope does two jobs in the state machine:</p>
+<div class="two-col">
+  <div class="card">
+    <h4 style="color: #CD3333;">Rising → Early escalation</h4>
+    <p>T ≥ 3, slope ≥ 2 → jump WATCH to WARNING</p>
+    <p>T ≥ 2, slope ≥ 1.5 → trigger WATCH early</p>
+  </div>
+  <div class="card">
+    <h4 style="color: #8B668B;">Flat/declining → Containment</h4>
+    <p>Stalled 3+ cycles, slope ≤ 0 → CONTAINED</p>
+    <p>Requires both temporal AND trajectory evidence</p>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════ -->
+<h2>6. Coherence Gate — "Is this real or random?" <span class="tag tag-improved">improved</span></h2>
+<p><strong>2 of 3 must be true</strong> before WATCH or WARNING triggers:</p>
+<table class="weight-table">
+  <tr><th>Condition</th><th>Checks</th></tr>
+  <tr><td><strong>Adjacency</strong></td><td>Are missing neighbors next to each other? Clustered = structured hazard.</td></tr>
+  <tr><td><strong>Persistence</strong></td><td>Same dominant direction for 2 of last 3 cycles? Consistent = real front.</td></tr>
+  <tr><td><strong>Progression</strong></td><td>New disappearances in that direction? Advancing = active front.</td></tr>
+</table>
+<p>If only 1 of 3 → probably coincidence → don't escalate. This is the false alarm filter.</p>
+
+<!-- ═══════════════════════════════════════════ -->
+<h2>7. Protocol States</h2>
+<div class="state-row"><div class="state-dot" style="background:#4682B4"></div><div class="state-label">NORMAL</div><div class="state-thresh">T = 0</div>All clear.</div>
+<div class="state-row"><div class="state-dot" style="background:#DAA520"></div><div class="state-label">WATCH</div><div class="state-thresh">T ≥ 3</div>Possible approaching hazard. Requires coherence ≥ 2.</div>
+<div class="state-row"><div class="state-dot" style="background:#CD853F"></div><div class="state-label">WARNING</div><div class="state-thresh">T ≥ 6</div>Confirmed front. Or T ≥ 3 with slope ≥ 2.</div>
+<div class="state-row"><div class="state-dot" style="background:#CD3333"></div><div class="state-label">IMPACT</div><div class="state-thresh">T ≥ 10</div>In the damage zone. No coherence needed.</div>
+<div class="state-row"><div class="state-dot" style="background:#8B668B"></div><div class="state-label">CONTAINED</div><div class="state-thresh">stall ≥ 3</div>Front stopped. No new damage + slope ≤ 0.</div>
+<div class="state-row"><div class="state-dot" style="background:#3CB371"></div><div class="state-label">RECOVERING</div><div class="state-thresh">rec &gt; 0</div>Neighbors coming back. No new damage.</div>
+<div class="state-row"><div class="state-dot" style="background:#B0B0B0"></div><div class="state-label">OFFLINE</div><div class="state-thresh">—</div>Unreachable. Neighbors detect it as missing.</div>
+<div class="flow-arrow">NORMAL → WATCH → WARNING → IMPACT → CONTAINED → RECOVERING → NORMAL</div>
+
+<!-- ═══════════════════════════════════════════ -->
+<h2>8. Spatial Hazard Reconstruction <span class="tag tag-new">new</span></h2>
+<p>Each node's dominant sub-score reveals its role. Across the network, this reconstructs the hazard shape with no central coordinator:</p>
+<div class="two-col">
+  <div class="card" style="border-left:3px solid #DAA520"><h4>LEADING EDGE</h4><p>FrontScore highest — hazard heading this way next.</p></div>
+  <div class="card" style="border-left:3px solid #CD3333"><h4>DAMAGE ZONE</h4><p>ImpactScore highest — surrounded by offline neighbors.</p></div>
+</div>
+<div class="two-col">
+  <div class="card" style="border-left:3px solid #8B668B"><h4>CONTAINMENT BOUNDARY</h4><p>ArrestScore dominant — the front stopped here.</p></div>
+  <div class="card" style="border-left:3px solid #4682B4"><h4>UNAFFECTED</h4><p>No elevated scores. Normal operations.</p></div>
+</div>
+
+<!-- ═══════════════════════════════════════════ -->
+<!-- ═══════════════════════════════════════════ -->
+<div class="section-divider"><span>How to Run</span></div>
+<!-- ═══════════════════════════════════════════ -->
+
+<!-- ─── ORIGINAL ─── -->
+<h2>9. Start the Node Network <span class="tag tag-original">original</span></h2>
+
+<h3>Start 64 nodes on an 8×8 hex grid:</h3>
+<pre><button class="cbtn" onclick="cc(this)">Copy</button><span class="cmt"># Start all 64 nodes in background</span>
+for i in $(seq 0 63); do python3 node.py $((9000+i)) 64 &amp; done</pre>
+
+<h3>Stop all nodes:</h3>
+<pre><button class="cbtn" onclick="cc(this)">Copy</button><span class="cmt"># Kill all running node processes</span>
+pkill -f "python3 node.py"</pre>
+
+<!-- ─── ORIGINAL ─── -->
+<h2>10. Manual Node Control <span class="tag tag-original">original</span></h2>
+
+<h3>Kill a node (simulate crash):</h3>
+<pre><button class="cbtn" onclick="cc(this)">Copy</button>curl -s -X POST http://127.0.0.1:9010/ \
+  -H "Content-Type: application/json" \
+  -d '{"op":"inject_fault","data":{"fault":"crash_sim","enable":true}}'</pre>
+
+<h3>Bring a node back:</h3>
+<pre><button class="cbtn" onclick="cc(this)">Copy</button>curl -s -X POST http://127.0.0.1:9010/ \
+  -H "Content-Type: application/json" \
+  -d '{"op":"inject_fault","data":{"fault":"crash_sim","enable":false}}'</pre>
+
+<h3>Set a node to ALERT (simulate sensor detection):</h3>
+<pre><button class="cbtn" onclick="cc(this)">Copy</button>curl -s -X POST http://127.0.0.1:9010/ \
+  -H "Content-Type: application/json" \
+  -d '{"op":"inject_state","data":{"sensor_state":"ALERT"}}'</pre>
+
+<h3>Set a node to RECOVERING:</h3>
+<pre><button class="cbtn" onclick="cc(this)">Copy</button>curl -s -X POST http://127.0.0.1:9010/ \
+  -H "Content-Type: application/json" \
+  -d '{"op":"inject_state","data":{"sensor_state":"RECOVERING"}}'</pre>
+
+<h3>Reset a node to NORMAL:</h3>
+<pre><button class="cbtn" onclick="cc(this)">Copy</button>curl -s -X POST http://127.0.0.1:9010/ \
+  -H "Content-Type: application/json" \
+  -d '{"op":"inject_state","data":{"sensor_state":"NORMAL"}}'</pre>
+
+<!-- ─── ORIGINAL ─── -->
+<h2>11. Pull a Node's State <span class="tag tag-original">original</span></h2>
+
+<h3>Pull full state from a single node (shows T, scores, neighbors, everything):</h3>
+<pre><button class="cbtn" onclick="cc(this)">Copy</button>curl -s -X POST http://127.0.0.1:9018/ \
+  -H "Content-Type: application/json" \
+  -d '{"op":"pull","data":{"kind":"neighbor_status"},"metadata":{"origin":"debug"}}' \
+  | python3 -m json.tool</pre>
+
+<!-- ─── ORIGINAL ─── -->
+<h2>12. Original Matplotlib Visualizer <span class="tag tag-original">original</span></h2>
+
+<h3>Run the dual-panel matplotlib visualizer (needs running nodes):</h3>
+<pre><button class="cbtn" onclick="cc(this)">Copy</button><span class="cmt"># Gossip View + Hex Map, interactive click-to-inspect</span>
+python3 visualize_mapping.py --base-port 9000 --n 64 --fps 2</pre>
+
+<h3>Run with auto-demo (corner spread):</h3>
+<pre><button class="cbtn" onclick="cc(this)">Copy</button>python3 visualize_mapping.py --base-port 9000 --n 64 --auto-demo spread --auto-period 10</pre>
+
+<h3>Run with auto-demo (tornado):</h3>
+<pre><button class="cbtn" onclick="cc(this)">Copy</button>python3 visualize_mapping.py --base-port 9000 --n 64 --auto-demo tornado --auto-period 10</pre>
+
+<h3>Keyboard controls in matplotlib visualizer:</h3>
+<table class="weight-table">
+  <tr><th>Key</th><th>Action</th></tr>
+  <tr><td><code>1</code></td><td>Start corner spread demo</td></tr>
+  <tr><td><code>2</code></td><td>Start tornado demo</td></tr>
+  <tr><td><code>c</code></td><td>Contain (stop spread)</td></tr>
+  <tr><td><code>v</code></td><td>Start recovery</td></tr>
+  <tr><td><code>d</code></td><td>Delete selected node (crash)</td></tr>
+  <tr><td><code>a</code></td><td>Add back selected node</td></tr>
+  <tr><td><code>h</code></td><td>Set selected node to ALERT</td></tr>
+  <tr><td><code>n</code></td><td>Set selected node to NORMAL</td></tr>
+  <tr><td><code>x</code></td><td>Reset all nodes</td></tr>
+  <tr><td><code>q</code></td><td>Quit</td></tr>
+</table>
+
+<!-- ═══════════════════════════════════════════ -->
+<div class="section-divider"><span>Improved / New Tools</span></div>
+<!-- ═══════════════════════════════════════════ -->
+
+<!-- ─── IMPROVED ─── -->
+<h2>13. Terminal Traffic Monitor <span class="tag tag-improved">improved</span></h2>
+<p>Live-updating terminal table showing all node states, T scores, sub-scores, slope, pull/push traffic counts, score breakdowns, and recent message traffic. Color-coded ANSI output. Use <code>16</code> nodes by default so it fits on a Mac screen more comfortably.</p>
+
+<h3>Monitor only (watch live traffic):</h3>
+<pre><button class="cbtn" onclick="cc(this)">Copy</button>python3 egess_monitor.py --n 16 --base 9000 --refresh 2</pre>
+
+<h3>Three-terminal setup for a small Mac-friendly run:</h3>
+<pre><button class="cbtn" onclick="cc(this)">Copy</button><span class="cmt"># Terminal 1: start 16 real nodes (no visualizer)</span>
+cd /Users/mustafa/egess
+./startnodes --nodes 16 --no-visualizer
+
+<span class="cmt"># Terminal 2: run the full monitor (shows all 16 nodes)</span>
+cd /Users/mustafa/egess
+python3 egess_monitor.py --n 16
+
+<span class="cmt"># Terminal 3: stop everything when you're done</span>
+cd /Users/mustafa/egess
+./stopnodes</pre>
+
+<h3>Monitor with compact view (only show active nodes):</h3>
+<pre><button class="cbtn" onclick="cc(this)">Copy</button>python3 egess_monitor.py --n 16 --compact</pre>
+
+<h3>Corner spread demo (show all 16 node states):</h3>
+<pre><button class="cbtn" onclick="cc(this)">Copy</button>python3 egess_monitor.py --demo spread --n 16</pre>
+<p><b>Important:</b> if you want to see every node in the table, do <b>not</b> use <code>--compact</code>. Compact mode hides quiet nodes and only shows active threat rows.</p>
+
+<h3>Corner spread demo in 3 terminals:</h3>
+<pre><button class="cbtn" onclick="cc(this)">Copy</button><span class="cmt"># Terminal 1: start the 16 nodes</span>
+cd /Users/mustafa/egess
+./startnodes --nodes 16 --no-visualizer
+
+<span class="cmt"># Terminal 2: run the spread demo in the terminal monitor (all 16 nodes visible)</span>
+cd /Users/mustafa/egess
+python3 egess_monitor.py --demo spread --n 16 --step-interval 8
+
+<span class="cmt"># Terminal 3: stop all nodes afterward</span>
+cd /Users/mustafa/egess
+./stopnodes</pre>
+
+<h3>Full 16-node demo block (copy/paste exactly):</h3>
+<pre><button class="cbtn" onclick="cc(this)">Copy</button><span class="cmt"># Terminal 1</span>
+cd /Users/mustafa/egess
+./startnodes --nodes 16 --no-visualizer
+
+<span class="cmt"># Terminal 2</span>
+cd /Users/mustafa/egess
+python3 egess_monitor.py --demo spread --n 16 --step-interval 8
+
+<span class="cmt"># Terminal 3</span>
+cd /Users/mustafa/egess
+./stopnodes</pre>
+
+<h3>Center tornado demo:</h3>
+<pre><button class="cbtn" onclick="cc(this)">Copy</button>python3 egess_monitor.py --demo tornado --n 16</pre>
+
+<h3>Slower spread demo:</h3>
+<pre><button class="cbtn" onclick="cc(this)">Copy</button>python3 egess_monitor.py --demo spread --n 16 --step-interval 8</pre>
+
+<h3>If you want a bigger table but still manageable:</h3>
+<pre><button class="cbtn" onclick="cc(this)">Copy</button>python3 egess_monitor.py --demo spread --n 32 --step-interval 8</pre>
+
+<h3>If you only want active threat nodes later, use compact mode:</h3>
+<pre><button class="cbtn" onclick="cc(this)">Copy</button>python3 egess_monitor.py --demo spread --n 16 --compact --step-interval 8</pre>
+
+<h3>See the actual full message text (not the shortened table view):</h3>
+<pre><button class="cbtn" onclick="cc(this)">Copy</button><span class="cmt"># Terminal 1: start the nodes</span>
+cd /Users/mustafa/egess
+./startnodes --nodes 16 --no-visualizer
+
+<span class="cmt"># Terminal 2: run the monitor/demo</span>
+cd /Users/mustafa/egess
+python3 egess_monitor.py --demo spread --n 16 --step-interval 8
+
+<span class="cmt"># Terminal 3: follow one node's full log messages</span>
+cd /Users/mustafa/egess
+RUN_DIR=$(ls -1dt runs/* | head -n 1)
+tail -f "$RUN_DIR"/node_9000.log
+
+<span class="cmt"># Terminal 4: stop all nodes when done</span>
+cd /Users/mustafa/egess
+./stopnodes</pre>
+
+<h3>See a few nodes at once with full log lines:</h3>
+<pre><button class="cbtn" onclick="cc(this)">Copy</button>cd /Users/mustafa/egess
+RUN_DIR=$(ls -1dt runs/* | head -n 1)
+for p in 9000 9001 9002 9003; do
+  echo "===== node_$p ====="
+  tail -n 30 "$RUN_DIR"/node_${p}.log
+done</pre>
+
+<p>The terminal monitor shows:</p>
+<table class="weight-table">
+  <tr><th>Column</th><th>What it shows</th></tr>
+  <tr><td><code>Port</code></td><td>Node port number (for <code>--n 16</code>, ports 9000–9015)</td></tr>
+  <tr><td><code>State</code></td><td>Protocol state (NORMAL, WATCH, WARNING, IMPACT, CONTAINED, RECOVERING)</td></tr>
+  <tr><td><code>T</code></td><td>Current T score</td></tr>
+  <tr><td><code>Slope</code></td><td>ΔT/cycle with arrow indicator (▲▲ rising fast, ▼ falling)</td></tr>
+  <tr><td><code>Front</code></td><td>FrontScore — approaching danger</td></tr>
+  <tr><td><code>Impact</code></td><td>ImpactScore — local damage</td></tr>
+  <tr><td><code>PullRx</code></td><td>Total pull requests received by this node</td></tr>
+  <tr><td><code>PushRx</code></td><td>Total push messages received by this node</td></tr>
+  <tr><td><code>Missing</code></td><td>Which neighbors are currently offline</td></tr>
+</table>
+<p>Threat colors in terminal output:</p>
+<table class="weight-table">
+  <tr><th>State</th><th>Color</th><th>Meaning</th></tr>
+  <tr><td><code>NORMAL</code></td><td>Blue</td><td>Stable / no immediate hazard</td></tr>
+  <tr><td><code>WATCH</code></td><td>Yellow</td><td>Possible approach</td></tr>
+  <tr><td><code>WARNING</code></td><td>Bright yellow</td><td>Stronger incoming threat</td></tr>
+  <tr><td><code>IMPACT</code></td><td>Red</td><td>Local damage zone</td></tr>
+  <tr><td><code>STALLED</code> / <code>CONTAINED</code></td><td>Purple</td><td>Front arrested</td></tr>
+  <tr><td><code>RECOVERING</code></td><td>Green</td><td>Nodes coming back</td></tr>
+  <tr><td><code>OFFLINE</code></td><td>Gray</td><td>Node unavailable</td></tr>
+</table>
+<p><b>Tip:</b> the monitor table shortens long message lines so it fits the screen. If you want the full raw pull/push text, use the log-tail commands above.</p>
+<p>Bottom of the monitor also shows two debug sections:</p>
+<table class="weight-table">
+  <tr><th>Section</th><th>What it shows</th></tr>
+  <tr><td><code>Score Details</code></td><td>For active nodes: T, Front, Impact, Arrest, coherence, no-progress cycles, and which neighbors contributed to the score</td></tr>
+  <tr><td><code>Recent Messages</code></td><td>Recent pull/push lines from active nodes, so you can see the raw traffic that led to score changes</td></tr>
+</table>
+<p>Monitor demos automatically reset nodes back to <code>NORMAL</code> when you press <code>Ctrl+C</code>.</p>
+
+<!-- ─── NEW ─── -->
+<h2>14. React Interactive Demo <span class="tag tag-new">new</span></h2>
+<p>Browser-based interactive visualizer with dual hex maps, live scoring math, slope sparklines, coherence gate display, and hazard detection. Runs independently — does not need real nodes.</p>
+
+<h3>Run locally with React:</h3>
+<pre><button class="cbtn" onclick="cc(this)">Copy</button>npm create vite@latest egess-demo -- --template react
+cd /Users/mustafa/egess/egess-demo
+npm install
+# If Vite auto-starts the default starter page, stop it with Ctrl+C first
+cp /Users/mustafa/egess/egess.jsx src/App.jsx
+# Then run the app again with the EGESS component
+npm run dev
+<span class="cmt"># Opens at http://localhost:5173</span></pre>
+
+<h3>If the app already exists, run this:</h3>
+<pre><button class="cbtn" onclick="cc(this)">Copy</button>cd /Users/mustafa/egess/egess-demo
+cp /Users/mustafa/egess/egess.jsx src/App.jsx
+npm run dev
+<span class="cmt"># Opens at http://localhost:5173</span></pre>
+
+<h3>What the React demo includes:</h3>
+<table class="weight-table">
+  <tr><th>Feature</th><th>Description</th></tr>
+  <tr><td>Figure A — Gossip View</td><td>Hex grid with neighbor connection edges, click to inspect</td></tr>
+  <tr><td>Figure B — Threshold Map</td><td>Hex grid colored by state, T score in center</td></tr>
+  <tr><td>Hazard Detection Bar</td><td>Live status: CLEAR → APPROACHING → ACTIVE SPREAD → CONTAINED → RECOVERING</td></tr>
+  <tr><td>Live Metrics</td><td>Detection latency, false positive rate, spatial accuracy</td></tr>
+  <tr><td>Scoring Reference</td><td>Collapsible panel showing all formulas and weights</td></tr>
+  <tr><td>Node Inspector</td><td>Click any node: left = pull math, right = scores/slope/coherence</td></tr>
+  <tr><td>Manual Controls</td><td>Kill, Alert, Recover, Normal buttons for selected node</td></tr>
+  <tr><td>Demos</td><td>Corner Spread and Tornado with 2 protocol ticks per step</td></tr>
+</table>
+
+<!-- ─── NEW ─── -->
+<h2>15. Serve This Protocol Page <span class="tag tag-new">new</span></h2>
+
+<h3>Serve locally:</h3>
+<pre><button class="cbtn" onclick="cc(this)">Copy</button>cd /Users/mustafa/egess
+python3 -m http.server 8080
+<span class="cmt"># Open http://localhost:8080/egess_protocol.html</span></pre>
+
+</body>
+</html>

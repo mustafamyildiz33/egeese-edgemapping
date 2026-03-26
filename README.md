@@ -9,6 +9,26 @@ This project uses *Google style* docstrings. Although this is a scientific proje
 
 ## How to run it?
 
+Current detector layout:
+- `T` is the conservative combined instability score.
+- `destruction` lane confirms sudden missing/unreachable neighbors.
+- `spread` lane confirms persistent disagreement/spread around a node.
+
+### Fast Start (`startnodes`)
+Single command to start nodes and launch the auto visual demo:
+```
+./startnodes
+```
+Stop with:
+```
+./stopnodes
+```
+Useful options:
+```
+./startnodes --nodes 16 --grid 4 --auto-demo firebomb --auto-period 10
+./startnodes --no-visualizer
+```
+
 ### Step I: Start the nodes
 ```
 EGESS_LOG=1 ./start_nodes.sh 16
@@ -32,8 +52,9 @@ If needed, send a trigger message to initiate the forwarding sequence. You can r
 ### Live Demo Controls (Visualizer)
 Run the live visualizer in a separate terminal:
 ```
-./.venv/bin/python visualize_mapping.py --base-port 9000 --n 16 --grid 4
+./.venv/bin/python visualize_mapping.py --base-port 9000 --n 16 --grid 0
 ```
+`--grid 0` means auto-detect from node state (prevents topology mismatch).
 Inside the map:
 - Click a node in either panel: select + zoom to that node and show inspector details (`T`, trend, drivers, message counters, recent pull/push traffic).
 - Press `1..6`: toggle manual disagreement slots for the selected node (each active slot contributes `+1` to `T`).
@@ -44,12 +65,24 @@ Inside the map:
 - Press `f`: toggle `flap` on selected node.
 - Press `r` / `Esc` / `Home`: reset view.
 - Press `q`: quit the visualizer.
+- Press `i`: compact/full inspector panel.
+- Press `j` / `k`: scroll inspector details (in full mode).
 
 Hands-off automatic fire/bomb demo (no key presses):
 ```
-./.venv/bin/python visualize_mapping.py --base-port 9000 --n 16 --grid 4 --auto-demo firebomb --auto-period 10
+./.venv/bin/python visualize_mapping.py --base-port 9000 --n 16 --grid 0 --auto-demo firebomb --auto-period 10
 ```
 This cycles through baseline -> fire/disagreement -> bomb/crash -> recovery, and auto-sends push messages.
+
+### One-Command Proof Run (for review/demo evidence)
+To automatically run the protocol, generate traffic/fault stages, export evidence JSON, and stop nodes:
+```
+./demo_proof.sh --nodes 16 --duration 60
+```
+Outputs are written into the latest run directory:
+- `runs/<timestamp>/demo_events.jsonl`
+- `runs/<timestamp>/protocol_evidence.json`
+- `runs/<timestamp>/protocol_summary.txt`
 
 ### Step IV: Stop the nodes
 Stop the network and kill all nodes using this command:

@@ -1,22 +1,14 @@
 # EGESS - Experimental Gear for Evaluation of Swarm Systems
 # Copyright (C) 2026  Nick Ivanov and ACSUS Lab <ivanov@rowan.edu>
 
-# This program is free software: you can redistribute it and/or modify
-# it under the terms of the GNU General Public License as published by
-# the Free Software Foundation, either version 3 of the License, or
-# (at your option) any later version.
-
-# This program is distributed in the hope that it will be useful,
-# but WITHOUT ANY WARRANTY; without even the implied warranty of
-# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-# GNU General Public License for more details.
-
-# You should have received a copy of the GNU General Public License
-# along with this program.  If not, see <https://www.gnu.org/licenses/>.
-
+import copy
 import os
+import queue
 import time
 import egess_api
+
+
+EVENT_TYPES = ("front_alert", "stall_notice", "recovery_notice")
 
 
 def _demo_mode() -> bool:
@@ -76,6 +68,124 @@ def _add_recent_msg(node_state, message):
         del events[:-60]
 
 
+def _reading_for_sensor_state(sensor_state):
+    state = str(sensor_state).strip().upper()
+    if state == "ALERT":
+        return "RED"
+    if state == "RECOVERING":
+        return "GREEN"
+    return "BLUE"
+
+
+def _reset_runtime_state(node_state):
+    node_state["sensor_state"] = "NORMAL"
+    node_state["local_reading"] = "BLUE"
+    node_state["protocol_state"] = "NORMAL"
+    node_state["boundary_kind"] = "stable"
+    node_state["dfa_state"] = 1
+
+    node_state["score"] = 0.0
+    node_state["raw_score"] = 0.0
+    node_state["score_delta"] = 0.0
+    node_state["score_trend"] = "steady (0)"
+    node_state["score_bucket"] = 0
+
+    node_state["front_score"] = 0.0
+    node_state["impact_score"] = 0.0
+    node_state["arrest_score"] = 0.0
+    node_state["coherence_score"] = 0
+    node_state["front_score_by_sector"] = {}
+    node_state["front_components"] = {}
+    node_state["impact_components"] = {}
+    node_state["arrest_components"] = {}
+    node_state["coherence_components"] = {}
+
+    node_state["dominant_sector"] = 0
+    node_state["dominant_sector_history"] = []
+    node_state["active_sectors"] = []
+    node_state["front_width"] = 0
+    node_state["no_progress_cycles"] = 0
+
+    node_state["neighbor_states"] = {}
+    node_state["neighbor_miss_streak"] = {}
+    node_state["current_missing_neighbors"] = []
+    node_state["new_missing_neighbors"] = []
+    node_state["persistent_missing_neighbors"] = []
+    node_state["recovered_neighbors"] = []
+
+    node_state["incoming_events"] = []
+    node_state["seen_event_ids"] = []
+    node_state["recent_alerts"] = []
+
+    node_state["last_cycle_ts"] = 0.0
+    node_state["last_state_change_ts"] = 0.0
+    node_state["pull_cycles"] = 0
+    node_state["event_seq"] = 0
+
+    counters = node_state.get("msg_counters", {})
+    if not isinstance(counters, dict):
+        counters = {}
+    for key in (
+        "pull_rx",
+        "push_rx",
+        "pull_tx",
+        "push_tx",
+        "tx_ok",
+        "tx_fail",
+        "tx_timeout",
+        "tx_conn_error",
+    ):
+        counters[key] = 0
+    node_state["msg_counters"] = counters
+    node_state["recent_msgs"] = []
+
+
+def _remember_event(node_state, mtype, event_id, origin, relay, payload):
+    seen = node_state.get("seen_event_ids", [])
+    if not isinstance(seen, list):
+        seen = []
+    if event_id in seen:
+        node_state["seen_event_ids"] = seen
+        return False
+
+    if isinstance(event_id, str) and len(event_id) > 0:
+        seen.append(event_id)
+        if len(seen) > 200:
+            seen = seen[-200:]
+        node_state["seen_event_ids"] = seen
+
+    incoming = node_state.get("incoming_events", [])
+    if not isinstance(incoming, list):
+        incoming = []
+    incoming.append(
+        {
+            "type": str(mtype),
+            "event_id": str(event_id),
+            "origin": int(origin) if isinstance(origin, int) else 0,
+            "relay": int(relay) if isinstance(relay, int) else 0,
+            "ts": float(time.time()),
+            "state": str(payload.get("state", "")) if isinstance(payload, dict) else "",
+        }
+    )
+    if len(incoming) > 120:
+        incoming = incoming[-120:]
+    node_state["incoming_events"] = incoming
+
+    recent = node_state.get("recent_alerts", [])
+    if not isinstance(recent, list):
+        recent = []
+    label = str(mtype)
+    if isinstance(payload, dict):
+        state = str(payload.get("state", "")).strip().upper()
+        if state:
+            label = "{}:{}".format(label, state)
+    recent.append(label)
+    if len(recent) > 20:
+        recent = recent[-20:]
+    node_state["recent_alerts"] = recent
+    return True
+
+
 def listener_protocol(config_json, node_state, state_lock, this_port, number_of_nodes, push_queue, msg):
     op = msg.get("op", "")
 
@@ -97,17 +207,45 @@ def listener_protocol(config_json, node_state, state_lock, this_port, number_of_
                 faults["crash_sim"] = False
                 faults["lie_sensor"] = False
                 faults["flap"] = False
+                _reset_runtime_state(node_state)
+                _add_recent_msg(node_state, "runtime_reset")
             elif fault in ("crash_sim", "lie_sensor", "flap"):
                 faults[fault] = enable
             else:
                 return {
                     "op": "receipt",
-                    "data": {
-                        "success": False,
-                        "message": "unknown_fault"
-                    },
+                    "data": {"success": False, "message": "unknown_fault"},
                     "metadata": {}
                 }
+        finally:
+            state_lock.release()
+
+        if _verbose_logs() and fault == "crash_sim":
+            egess_api.write_data_point(this_port, "state_change", "DESTROYED={}".format(bool(enable)))
+
+        return {
+            "op": "receipt",
+            "data": {"success": True, "message": "fault_updated", "faults": faults},
+            "metadata": {}
+        }
+
+    if op == "inject_state":
+        data = msg.get("data", {})
+        if not isinstance(data, dict):
+            data = {}
+        sensor_state = str(data.get("sensor_state", "NORMAL")).strip().upper()
+        if sensor_state not in ("NORMAL", "ALERT", "RECOVERING"):
+            return {
+                "op": "receipt",
+                "data": {"success": False, "message": "unknown_sensor_state"},
+                "metadata": {}
+            }
+
+        state_lock.acquire()
+        try:
+            node_state["sensor_state"] = sensor_state
+            node_state["local_reading"] = _reading_for_sensor_state(sensor_state)
+            _add_recent_msg(node_state, "sensor_state={}".format(sensor_state))
         finally:
             state_lock.release()
 
@@ -115,8 +253,9 @@ def listener_protocol(config_json, node_state, state_lock, this_port, number_of_
             "op": "receipt",
             "data": {
                 "success": True,
-                "message": "fault_updated",
-                "faults": faults
+                "message": "sensor_state_updated",
+                "sensor_state": sensor_state,
+                "local_reading": _reading_for_sensor_state(sensor_state)
             },
             "metadata": {}
         }
@@ -127,7 +266,6 @@ def listener_protocol(config_json, node_state, state_lock, this_port, number_of_
     finally:
         state_lock.release()
 
-    # Simulate a node that exists but is not responsive enough for pull timeouts.
     if crash_sim:
         state_lock.acquire()
         try:
@@ -137,10 +275,7 @@ def listener_protocol(config_json, node_state, state_lock, this_port, number_of_
         time.sleep(1.1)
         return {
             "op": "receipt",
-            "data": {
-                "success": False,
-                "message": "node_unavailable(crash_sim)"
-            },
+            "data": {"success": False, "message": "node_unavailable(crash_sim)"},
             "metadata": {}
         }
 
@@ -151,117 +286,113 @@ def listener_protocol(config_json, node_state, state_lock, this_port, number_of_
             counters["pull_rx"] = int(counters.get("pull_rx", 0)) + 1
             origin = msg.get("metadata", {}).get("origin", "viz")
             _add_recent_msg(node_state, "rx:pull <- {}".format(origin))
+            snapshot = copy.deepcopy(node_state)
         finally:
             state_lock.release()
 
         if _verbose_logs():
             print("PULL REQUEST RECEIVED\n")
-            egess_api.write_data_point(this_port, "pull_request_received", str(0))
+            egess_api.write_data_point(this_port, "pull_request_received", str(origin))
         return {
             "op": "receipt",
-            "data": {
-                "success": True,
-                "message": "",
-                "node_state": node_state
-            },
+            "data": {"success": True, "message": "", "node_state": snapshot},
             "metadata": {}
         }
 
-    elif op == "push":
-        metadata = msg.get("metadata", {})
-        if not isinstance(metadata, dict):
-            metadata = {}
-            msg["metadata"] = metadata
-
-        try:
-            forward_count = int(metadata.get("forward_count", 0))
-        except Exception:
-            forward_count = 0
-
-        max_forwards = int(config_json.get("max_forwards", 8))
-
-        if forward_count < max_forwards:
-            state_lock.acquire()
-            try:
-                counters, _ = _touch_msg_telemetry(node_state)
-                counters["push_rx"] = int(counters.get("push_rx", 0)) + 1
-                origin = msg.get("metadata", {}).get("origin", 0)
-                _add_recent_msg(node_state, "rx:push <- {}".format(origin))
-                node_state["accepted_messages"] = int(node_state.get("accepted_messages", 0)) + 1
-
-                relay = msg.get("metadata", {}).get("relay", 0)
-                if isinstance(relay, int) and relay != 0:
-                    if "known_nodes" not in node_state or not isinstance(node_state["known_nodes"], list):
-                        node_state["known_nodes"] = []
-                    if relay not in node_state["known_nodes"] and relay != this_port:
-                        node_state["known_nodes"].append(relay)
-
-                data = msg.get("data", {})
-                mtype = ""
-                if isinstance(data, dict):
-                    mtype = data.get("type", "")
-
-                origin = msg.get("metadata", {}).get("origin", 0)
-                now = time.time()
-
-                if mtype == "heartbeat":
-                    if isinstance(origin, int) and origin != 0:
-                        if "last_seen" not in node_state or not isinstance(node_state["last_seen"], dict):
-                            node_state["last_seen"] = {}
-                        node_state["last_seen"][str(origin)] = now
-
-                if mtype == "missing_report":
-                    missing_port = 0
-                    if isinstance(data, dict):
-                        missing_port = data.get("missing_port", 0)
-                    if isinstance(origin, int) and origin != 0 and isinstance(missing_port, int) and missing_port != 0:
-                        if "missing_reports" not in node_state or not isinstance(node_state["missing_reports"], dict):
-                            node_state["missing_reports"] = {}
-                        key = str(missing_port)
-                        node_state["missing_reports"][key] = int(node_state["missing_reports"].get(key, 0)) + 1
-
-                if not _demo_mode():
-                    egess_api.write_state_change_data_point(this_port, node_state, "accepted_messages")
-                    egess_api.write_state_change_data_point(this_port, node_state, "known_nodes")
-
-            finally:
-                state_lock.release()
-
-            msg["metadata"]["relay"] = this_port
-            msg["metadata"]["forward_count"] = forward_count + 1
-            push_queue.put(msg)
-            state_lock.acquire()
-            try:
-                _add_recent_msg(node_state, "enqueue:push fwd={}".format(msg["metadata"]["forward_count"]))
-            finally:
-                state_lock.release()
-
-            return {
-                "op": "receipt",
-                "data": {
-                    "success": True,
-                    "message": "message enqueued"
-                },
-                "metadata": {}
-            }
-        else:
-            return {
-                "op": "receipt",
-                "data": {
-                    "success": False,
-                    "message": "message is not enqueued"
-                },
-                "metadata": {}
-            }
-
-    else:
+    if op != "push":
         if _verbose_logs():
             print("ERROR: listener_protocol: unknown type of message: {}\n".format(op))
         return {
             "op": "receipt",
-            "data": {
-                "success": False,
-                "message": "unknown operation"
-            },
+            "data": {"success": False, "message": "unknown operation"},
             "metadata": {}
         }
+
+    metadata = msg.get("metadata", {})
+    if not isinstance(metadata, dict):
+        metadata = {}
+        msg["metadata"] = metadata
+
+    try:
+        forward_count = int(metadata.get("forward_count", 0))
+    except Exception:
+        forward_count = 0
+
+    max_forwards = int(config_json.get("max_forwards", 8))
+    if forward_count >= max_forwards:
+        return {
+            "op": "receipt",
+            "data": {"success": False, "message": "message is not enqueued"},
+            "metadata": {}
+        }
+
+    data = msg.get("data", {})
+    if not isinstance(data, dict):
+        data = {}
+    mtype = str(data.get("type", "")).strip()
+    origin = msg.get("metadata", {}).get("origin", 0)
+    relay = msg.get("metadata", {}).get("relay", 0)
+    event_id = str(data.get("event_id", "")).strip()
+
+    state_lock.acquire()
+    try:
+        counters, _ = _touch_msg_telemetry(node_state)
+        counters["push_rx"] = int(counters.get("push_rx", 0)) + 1
+        _add_recent_msg(node_state, "rx:push <- {}".format(origin))
+        node_state["accepted_messages"] = int(node_state.get("accepted_messages", 0)) + 1
+
+        if isinstance(relay, int) and relay != 0:
+            known_nodes = node_state.get("known_nodes", [])
+            if not isinstance(known_nodes, list):
+                known_nodes = []
+            if relay not in known_nodes and relay != this_port:
+                known_nodes.append(relay)
+            node_state["known_nodes"] = known_nodes
+
+        duplicate = False
+        if mtype in EVENT_TYPES and isinstance(event_id, str) and len(event_id) > 0:
+            duplicate = not _remember_event(node_state, mtype, event_id, origin, relay, data)
+            if duplicate:
+                _add_recent_msg(node_state, "dup:{} {}".format(mtype, event_id))
+
+        if not _demo_mode():
+            egess_api.write_state_change_data_point(this_port, node_state, "accepted_messages")
+            egess_api.write_state_change_data_point(this_port, node_state, "known_nodes")
+    finally:
+        state_lock.release()
+
+    if duplicate:
+        return {
+            "op": "receipt",
+            "data": {"success": True, "message": "duplicate_ignored"},
+            "metadata": {}
+        }
+
+    fwd_msg = copy.deepcopy(msg)
+    fwd_msg["metadata"]["relay"] = this_port
+    fwd_msg["metadata"]["forward_count"] = forward_count + 1
+    try:
+        push_queue.put_nowait(fwd_msg)
+    except queue.Full:
+        state_lock.acquire()
+        try:
+            _add_recent_msg(node_state, "drop:push queue_full")
+        finally:
+            state_lock.release()
+        return {
+            "op": "receipt",
+            "data": {"success": False, "message": "queue_full"},
+            "metadata": {}
+        }
+
+    state_lock.acquire()
+    try:
+        _add_recent_msg(node_state, "enqueue:push fwd={}".format(fwd_msg["metadata"]["forward_count"]))
+    finally:
+        state_lock.release()
+
+    return {
+        "op": "receipt",
+        "data": {"success": True, "message": "message enqueued"},
+        "metadata": {}
+    }
