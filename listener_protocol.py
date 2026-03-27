@@ -144,7 +144,8 @@ def _remember_event(node_state, mtype, event_id, origin, relay, payload):
     seen = node_state.get("seen_event_ids", [])
     if not isinstance(seen, list):
         seen = []
-    if event_id in seen:
+    seen_set = set(seen)
+    if event_id in seen_set:
         node_state["seen_event_ids"] = seen
         return False
 
@@ -199,8 +200,7 @@ def listener_protocol(config_json, node_state, state_lock, this_port, number_of_
         if period_sec < 1:
             period_sec = 1
 
-        state_lock.acquire()
-        try:
+        with state_lock:
             faults = _faults(node_state)
             faults["period_sec"] = period_sec
             if fault == "reset":
@@ -217,8 +217,6 @@ def listener_protocol(config_json, node_state, state_lock, this_port, number_of_
                     "data": {"success": False, "message": "unknown_fault"},
                     "metadata": {}
                 }
-        finally:
-            state_lock.release()
 
         if _verbose_logs() and fault == "crash_sim":
             egess_api.write_data_point(this_port, "state_change", "DESTROYED={}".format(bool(enable)))
@@ -241,13 +239,10 @@ def listener_protocol(config_json, node_state, state_lock, this_port, number_of_
                 "metadata": {}
             }
 
-        state_lock.acquire()
-        try:
+        with state_lock:
             node_state["sensor_state"] = sensor_state
             node_state["local_reading"] = _reading_for_sensor_state(sensor_state)
             _add_recent_msg(node_state, "sensor_state={}".format(sensor_state))
-        finally:
-            state_lock.release()
 
         return {
             "op": "receipt",
@@ -260,18 +255,12 @@ def listener_protocol(config_json, node_state, state_lock, this_port, number_of_
             "metadata": {}
         }
 
-    state_lock.acquire()
-    try:
+    with state_lock:
         crash_sim = bool(_faults(node_state).get("crash_sim", False))
-    finally:
-        state_lock.release()
 
     if crash_sim:
-        state_lock.acquire()
-        try:
+        with state_lock:
             _add_recent_msg(node_state, "drop:{} (crash_sim)".format(op))
-        finally:
-            state_lock.release()
         time.sleep(1.1)
         return {
             "op": "receipt",
@@ -280,15 +269,12 @@ def listener_protocol(config_json, node_state, state_lock, this_port, number_of_
         }
 
     if op == "pull":
-        state_lock.acquire()
-        try:
+        with state_lock:
             counters, _ = _touch_msg_telemetry(node_state)
             counters["pull_rx"] = int(counters.get("pull_rx", 0)) + 1
             origin = msg.get("metadata", {}).get("origin", "viz")
             _add_recent_msg(node_state, "rx:pull <- {}".format(origin))
             snapshot = copy.deepcopy(node_state)
-        finally:
-            state_lock.release()
 
         if _verbose_logs():
             print("PULL REQUEST RECEIVED\n")
@@ -334,8 +320,7 @@ def listener_protocol(config_json, node_state, state_lock, this_port, number_of_
     relay = msg.get("metadata", {}).get("relay", 0)
     event_id = str(data.get("event_id", "")).strip()
 
-    state_lock.acquire()
-    try:
+    with state_lock:
         counters, _ = _touch_msg_telemetry(node_state)
         counters["push_rx"] = int(counters.get("push_rx", 0)) + 1
         _add_recent_msg(node_state, "rx:push <- {}".format(origin))
@@ -358,8 +343,6 @@ def listener_protocol(config_json, node_state, state_lock, this_port, number_of_
         if not _demo_mode():
             egess_api.write_state_change_data_point(this_port, node_state, "accepted_messages")
             egess_api.write_state_change_data_point(this_port, node_state, "known_nodes")
-    finally:
-        state_lock.release()
 
     if duplicate:
         return {
@@ -374,22 +357,16 @@ def listener_protocol(config_json, node_state, state_lock, this_port, number_of_
     try:
         push_queue.put_nowait(fwd_msg)
     except queue.Full:
-        state_lock.acquire()
-        try:
+        with state_lock:
             _add_recent_msg(node_state, "drop:push queue_full")
-        finally:
-            state_lock.release()
         return {
             "op": "receipt",
             "data": {"success": False, "message": "queue_full"},
             "metadata": {}
         }
 
-    state_lock.acquire()
-    try:
+    with state_lock:
         _add_recent_msg(node_state, "enqueue:push fwd={}".format(fwd_msg["metadata"]["forward_count"]))
-    finally:
-        state_lock.release()
 
     return {
         "op": "receipt",

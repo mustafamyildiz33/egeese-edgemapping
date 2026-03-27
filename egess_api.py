@@ -115,16 +115,13 @@ def send_msg(config_json, node_state, state_lock, this_port, msg, target_port):
     j = target_port - config_json["base_port"]
     op = str(msg.get("op", "unknown"))
 
-    state_lock.acquire()
-    try:
+    with state_lock:
         counters = _ensure_msg_counters(node_state)
         if op == "pull":
             counters["pull_tx"] = int(counters.get("pull_tx", 0)) + 1
         elif op == "push":
             counters["push_tx"] = int(counters.get("push_tx", 0)) + 1
         _append_recent_msg(node_state, "tx:{} -> {}".format(op, target_port))
-    finally:
-        state_lock.release()
 
     try:
         time.sleep(node_state["latency_matrix"][i][j])
@@ -155,24 +152,18 @@ def send_msg(config_json, node_state, state_lock, this_port, msg, target_port):
                         this_port, target_port, msg, resp_json
                     )
                 )
-            state_lock.acquire()
-            try:
+            with state_lock:
                 counters = _ensure_msg_counters(node_state)
                 counters["tx_ok"] = int(counters.get("tx_ok", 0)) + 1
                 _append_recent_msg(node_state, "tx_ok:{} -> {}".format(op, target_port))
-            finally:
-                state_lock.release()
             return resp_json
         else:
             if _log_enabled():
                 print("ERROR: send_msg: return code is not 200.\n")
-            state_lock.acquire()
-            try:
+            with state_lock:
                 counters = _ensure_msg_counters(node_state)
                 counters["tx_fail"] = int(counters.get("tx_fail", 0)) + 1
                 _append_recent_msg(node_state, "tx_fail:{} -> {} status={}".format(op, target_port, resp.status_code))
-            finally:
-                state_lock.release()
             return {
                 "op": "receipt",
                 "data": {
@@ -185,14 +176,11 @@ def send_msg(config_json, node_state, state_lock, this_port, msg, target_port):
     except requests.exceptions.ConnectionError:
         if _log_enabled():
             print("ERROR: send_msg: Connection error.\n")
-        state_lock.acquire()
-        try:
+        with state_lock:
             counters = _ensure_msg_counters(node_state)
             counters["tx_conn_error"] = int(counters.get("tx_conn_error", 0)) + 1
             counters["tx_fail"] = int(counters.get("tx_fail", 0)) + 1
             _append_recent_msg(node_state, "tx_conn_error:{} -> {}".format(op, target_port))
-        finally:
-            state_lock.release()
         return {
             "op": "receipt",
             "data": {
@@ -204,14 +192,11 @@ def send_msg(config_json, node_state, state_lock, this_port, msg, target_port):
     except requests.exceptions.Timeout:
         if _log_enabled():
             print("ERROR: send_msg: Timeout.\n")
-        state_lock.acquire()
-        try:
+        with state_lock:
             counters = _ensure_msg_counters(node_state)
             counters["tx_timeout"] = int(counters.get("tx_timeout", 0)) + 1
             counters["tx_fail"] = int(counters.get("tx_fail", 0)) + 1
             _append_recent_msg(node_state, "tx_timeout:{} -> {}".format(op, target_port))
-        finally:
-            state_lock.release()
         return {
             "op": "receipt",
             "data": {
@@ -223,13 +208,10 @@ def send_msg(config_json, node_state, state_lock, this_port, msg, target_port):
     except Exception:
         if _log_enabled():
             print("ERROR: send_msg: Unknown error.\n")
-        state_lock.acquire()
-        try:
+        with state_lock:
             counters = _ensure_msg_counters(node_state)
             counters["tx_fail"] = int(counters.get("tx_fail", 0)) + 1
             _append_recent_msg(node_state, "tx_unknown_error:{} -> {}".format(op, target_port))
-        finally:
-            state_lock.release()
         return {
             "op": "receipt",
             "data": {

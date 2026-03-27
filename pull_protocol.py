@@ -304,11 +304,8 @@ def _queue_event(node_state, state_lock, push_queue, msg):
         push_queue.put_nowait(msg)
         return True
     except queue.Full:
-        state_lock.acquire()
-        try:
+        with state_lock:
             node_state["last_queue_drop"] = str(msg.get("data", {}).get("event_id", "queue_drop"))
-        finally:
-            state_lock.release()
         return False
 
 
@@ -346,8 +343,7 @@ def _publish_notice(config_json, node_state, state_lock, this_port, push_queue, 
 
 
 def pull_protocol(config_json, node_state, state_lock, this_port, number_of_nodes, push_queue):
-    state_lock.acquire()
-    try:
+    with state_lock:
         neighbors = node_state.get("neighbors", [])
         if not isinstance(neighbors, list):
             neighbors = []
@@ -363,8 +359,6 @@ def pull_protocol(config_json, node_state, state_lock, this_port, number_of_node
             history = []
         sensor_state = str(node_state.get("sensor_state", "NORMAL")).strip().upper()
         started_ts = _to_float(node_state.get("started_ts", 0.0), 0.0)
-    finally:
-        state_lock.release()
 
     startup_grace_sec = _to_float(config_json.get("startup_grace_sec", 4), 4.0)
     within_startup_grace = started_ts > 0.0 and (time.time() - started_ts) < startup_grace_sec
@@ -377,8 +371,7 @@ def pull_protocol(config_json, node_state, state_lock, this_port, number_of_node
         neighbors=neighbors,
     )
 
-    state_lock.acquire()
-    try:
+    with state_lock:
         transitions = _classify_neighbors(node_state, neighbors, missing_neighbors)
         node_state["neighbor_states"] = transitions["next_states"]
         node_state["neighbor_miss_streak"] = transitions["next_streak"]
@@ -388,8 +381,6 @@ def pull_protocol(config_json, node_state, state_lock, this_port, number_of_node
             node_state=node_state,
             this_port=this_port,
         )
-    finally:
-        state_lock.release()
 
     new_missing = transitions["new_missing"]
     persistent_missing = transitions["persistent_missing"]
@@ -564,8 +555,7 @@ def pull_protocol(config_json, node_state, state_lock, this_port, number_of_node
         boundary_kind = "recovering"
         dfa_state = STATE_VERIFY
 
-    state_lock.acquire()
-    try:
+    with state_lock:
         node_state["protocol_state"] = str(protocol_state)
         node_state["boundary_kind"] = str(boundary_kind)
         node_state["dfa_state"] = int(dfa_state)
@@ -622,8 +612,6 @@ def pull_protocol(config_json, node_state, state_lock, this_port, number_of_node
         node_state["pull_cycles"] = int(prev_pull_cycles) + 1
         if str(protocol_state) != str(prev_state):
             node_state["last_state_change_ts"] = float(time.time())
-    finally:
-        state_lock.release()
 
     if within_startup_grace:
         return
