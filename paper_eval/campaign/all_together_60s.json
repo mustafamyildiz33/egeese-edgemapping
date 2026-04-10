@@ -1,0 +1,14 @@
+{
+  "campaign_id": "all_together_60s",
+  "campaign_name": "All Scenarios Together",
+  "protocol": "egess",
+  "duration_sec": 60,
+  "run_count": 30,
+  "seed_base": 1000,
+  "node_counts": [49],
+  "scenario_specs": [
+    "../phase1/phase1_baseline_60s.json",
+    "../phase2/phase2_hazard_60s.json",
+    "../phase3/phase3_stress_60s.json"
+  ]
+}

@@ -88,6 +88,14 @@ def _add_recent_msg(node_state, message):
         del events[:-60]
 
 
+def _is_observer_pull(msg):
+    metadata = msg.get("metadata", {})
+    if not isinstance(metadata, dict):
+        metadata = {}
+    origin = str(metadata.get("origin", "")).strip().lower()
+    return origin in ("bootstrap", "paper_report", "paper_history", "paper_eval", "viz")
+
+
 def _reading_for_sensor_state(sensor_state):
     state = str(sensor_state).strip().upper()
     if state == "ALERT":
@@ -355,14 +363,19 @@ def listener_protocol(config_json, node_state, state_lock, this_port, number_of_
 
     if op == "pull":
         msg_size_bytes = egess_api.serialized_size_bytes(msg)
+        metadata = msg.get("metadata", {})
+        if not isinstance(metadata, dict):
+            metadata = {}
+        origin = metadata.get("origin", "viz")
+        observer_pull = _is_observer_pull(msg)
         state_lock.acquire()
         try:
             counters, _ = _touch_msg_telemetry(node_state)
-            counters["pull_rx"] = int(counters.get("pull_rx", 0)) + 1
-            counters["pull_rx_bytes"] = int(counters.get("pull_rx_bytes", 0)) + int(msg_size_bytes)
-            counters["rx_total_bytes"] = int(counters.get("rx_total_bytes", 0)) + int(msg_size_bytes)
-            origin = msg.get("metadata", {}).get("origin", "viz")
-            _add_recent_msg(node_state, "rx:pull <- {} bytes={}".format(origin, msg_size_bytes))
+            if not observer_pull:
+                counters["pull_rx"] = int(counters.get("pull_rx", 0)) + 1
+                counters["pull_rx_bytes"] = int(counters.get("pull_rx_bytes", 0)) + int(msg_size_bytes)
+                counters["rx_total_bytes"] = int(counters.get("rx_total_bytes", 0)) + int(msg_size_bytes)
+                _add_recent_msg(node_state, "rx:pull <- {} bytes={}".format(origin, msg_size_bytes))
             snapshot = copy.deepcopy(node_state)
         finally:
             state_lock.release()

@@ -100,14 +100,60 @@ const PAPER_OUTPUTS = [
   "runs/<timestamp>/paper_summary.tsv",
   "runs/<timestamp>/paper_watch_nodes.tsv",
   "paper_reports/<suite_id>_<timestamp>/all_runs.tsv",
-  "paper_reports/<suite_id>_<timestamp>/summary_by_nodes.tsv"
+  "paper_reports/<suite_id>_<timestamp>/summary_by_nodes.tsv",
+  "campaign_reports/<campaign_id>_<timestamp>/campaign_runs.tsv"
 ];
 const PAPER_SMOKE_COMMAND = "python3 paper_eval_runner.py --spec paper_eval/phase2/phase2_hazard_60s.json --max-runs 1 --node-counts 49 --duration-sec 10";
+const PAPER_CAMPAIGN_60_COMMAND = "python3 paper_eval_campaign.py --spec paper_eval/campaign/all_together_60s.json --max-batches 1 --node-counts 49";
+const PAPER_CAMPAIGN_120_COMMAND = "python3 paper_eval_campaign.py --spec paper_eval/campaign/all_together_120s.json --max-batches 1 --node-counts 49";
+const PAPER_CAMPAIGN_FULL_COMMAND = "python3 paper_eval_campaign.py --spec paper_eval/campaign/all_together_60s.json --node-counts 49";
 const PUSH_READY_ITEMS = [
   "Commit the runner, the phase specs, the implementation guide, and the React demo update together.",
   "Do not commit generated paper_reports; they are local validation output only.",
   "Run the 60s specs first, then rerun with 120s only if the team wants the longer set in the paper.",
   "Use the same seeds for EGESS and the check-in protocol when the comparison adapter is added."
+];
+const PAPER_HOME_MODES = [
+  {
+    key: "run",
+    title: "Run Evaluation",
+    tint: "#1F6C8C",
+    description: "Start a new benchmark batch or a single scenario.",
+    details: "You will see exact commands, expected timing, and which HTML/TSV outputs will be created."
+  },
+  {
+    key: "report",
+    title: "View Reports",
+    tint: "#9E2A2B",
+    description: "Open finished dashboards instead of starting anything new.",
+    details: "You will see campaign summaries, protocol comparisons, node spotlight pages, pull history, and raw exports."
+  }
+];
+const PAPER_REPORT_SURFACES = [
+  {
+    key: "campaign",
+    title: "Campaign Dashboard",
+    tint: "#1F6C8C",
+    description: "This is the best top-level report after an all-together run.",
+    shows: "Batch overview, one row per scenario per batch, and links into every scenario dashboard.",
+    command: "CAMPAIGN_DIR=$(ls -1dt campaign_reports/* | head -n 1)\nopen \"$CAMPAIGN_DIR/index.html\""
+  },
+  {
+    key: "suite",
+    title: "Scenario Suite Dashboard",
+    tint: "#B45309",
+    description: "Use this when you want to compare one scenario across saved runs.",
+    shows: "Protocol comparison tabs, averages, suite charts, watched-node tables, and grouped node-count summaries.",
+    command: "REPORT_DIR=$(ls -1dt paper_reports/* | head -n 1)\nopen \"$REPORT_DIR/index.html\""
+  },
+  {
+    key: "run",
+    title: "Single Run Deep Dive",
+    tint: "#2E7D32",
+    description: "Use this when you want to inspect one finished run in detail.",
+    shows: "Node Spotlight, pull history, watch-node history, all-node snapshot, and raw per-run files.",
+    command: "RUN_DIR=$(ls -1dt runs/* | head -n 1)\nopen \"$RUN_DIR/paper_summary.html\""
+  }
 ];
 
 const hintStyle = { fontSize: "8px", color: "#999", fontStyle: "italic", marginBottom: 1, lineHeight: "1.35" };
@@ -586,6 +632,7 @@ export default function EGESSDemo() {
   const [inspOpen, setInspOpen] = useState(true);
   const [refOpen, setRefOpen] = useState(false);
   const [paperOpen, setPaperOpen] = useState(true);
+  const [paperView, setPaperView] = useState("run");
   const [calcDeg, setCalcDeg] = useState(120);
   const [calcX, setCalcX] = useState(-2.5);
   const [calcY, setCalcY] = useState(2.6);
@@ -1331,82 +1378,218 @@ export default function EGESSDemo() {
 
       <div style={{ flexShrink: 0, borderTop: "1px solid #ccc", background: "#fff", overflow: "hidden" }}>
         <div onClick={() => setPaperOpen(!paperOpen)} style={{ padding: "4px 16px", cursor: "pointer", display: "flex", justifyContent: "space-between", alignItems: "center", background: "#F5F8FA", borderBottom: paperOpen ? "1px solid #d8e1e8" : "none" }}>
-          <span style={{ fontSize: "11px", fontWeight: "bold" }}>{paperOpen ? "▼" : "▶"} Paper Evaluation Runbook</span>
-          <span style={{ fontSize: "9px", color: "#7b8794", fontFamily: "monospace" }}>terminal + React aligned</span>
+          <span style={{ fontSize: "11px", fontWeight: "bold" }}>{paperOpen ? "▼" : "▶"} Paper Evaluation Home</span>
+          <span style={{ fontSize: "9px", color: "#7b8794", fontFamily: "monospace" }}>choose run or report</span>
         </div>
         {paperOpen && (
           <div style={{ padding: "10px 16px 12px", display: "flex", flexDirection: "column", gap: 10, background: "linear-gradient(180deg, #fff 0%, #fcfcf8 100%)" }}>
             <div style={{ display: "flex", flexWrap: "wrap", gap: 10 }}>
-              <div style={{ ...cardStyle, marginTop: 0, flex: "1 1 360px", borderLeft: "4px solid #1F6C8C", background: "#F7FBFD" }}>
-                <div style={{ fontWeight: "bold", fontSize: "11px", marginBottom: 4 }}>Implementation Guide</div>
-                <div style={{ fontSize: "9px", lineHeight: 1.7, color: "#4b5563" }}>
-                  The shareable team doc lives at <code>PAPER_EVAL_IMPLEMENTATION.md</code>. The runner entry point is <code>paper_eval_runner.py</code>, and the phase specs live under <code>paper_eval/</code>.
-                </div>
-                <div style={{ fontSize: "9px", marginTop: 6, color: "#0f4c5c" }}>
-                  Exact active windows: <b>60s</b> and <b>120s</b>. Default paper set: <b>49 / 64 / 81 nodes</b>, <b>30 runs each</b>.
-                </div>
-              </div>
-              <div style={{ ...cardStyle, marginTop: 0, flex: "1 1 320px", borderLeft: "4px solid #B45309", background: "#FFF9F1" }}>
-                <div style={{ fontWeight: "bold", fontSize: "11px", marginBottom: 4 }}>Suite Outputs</div>
-                <div style={{ fontSize: "9px", lineHeight: 1.7, color: "#5b4636" }}>
-                  {PAPER_OUTPUTS.map(path => (
-                    <div key={path}><code>{path}</code></div>
-                  ))}
-                </div>
-                <div style={{ fontSize: "8px", color: "#8b6b4a", marginTop: 6 }}>
-                  TSV outputs paste cleanly into Excel for color-coded scorecards and grouped figures.
-                </div>
-              </div>
-              <div style={{ ...cardStyle, marginTop: 0, flex: "1 1 320px", borderLeft: "4px solid #2E7D32", background: "#F8FCF8" }}>
-                <div style={{ fontWeight: "bold", fontSize: "11px", marginBottom: 4 }}>Same-Computer Smoke Test</div>
-                <div style={{ fontSize: "9px", lineHeight: 1.7, color: "#355E3B" }}>
-                  One laptop is enough for implementation, evaluation, and validation. Use this short run before the full `60s` or `120s` suites.
-                </div>
-                <div style={{ marginTop: 7, padding: "5px 6px", background: "#eef8ee", borderRadius: 3 }}>
-                  <code style={{ display: "block", whiteSpace: "pre-wrap", overflowWrap: "anywhere", fontSize: "9px", lineHeight: 1.5 }}>
-                    {PAPER_SMOKE_COMMAND}
-                  </code>
-                </div>
-              </div>
+              {PAPER_HOME_MODES.map(mode => {
+                const active = paperView === mode.key;
+                return (
+                  <button
+                    key={mode.key}
+                    type="button"
+                    onClick={() => setPaperView(mode.key)}
+                    style={{
+                      flex: "1 1 260px",
+                      textAlign: "left",
+                      border: active ? `1px solid ${mode.tint}` : "1px solid #d8e1e8",
+                      borderLeft: `4px solid ${mode.tint}`,
+                      borderRadius: 4,
+                      padding: "10px 12px",
+                      background: active ? "#F8FBFF" : "#fff",
+                      cursor: "pointer",
+                      boxShadow: active ? "0 0 0 1px rgba(31,108,140,0.08)" : "none"
+                    }}
+                  >
+                    <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "baseline" }}>
+                      <div style={{ fontWeight: "bold", fontSize: "11px", color: mode.tint }}>{mode.title}</div>
+                      <span style={{ fontSize: "8px", color: active ? mode.tint : "#777", fontFamily: "monospace" }}>{active ? "selected" : "available"}</span>
+                    </div>
+                    <div style={{ fontSize: "9px", color: "#444", marginTop: 5, lineHeight: 1.7 }}>{mode.description}</div>
+                    <div style={{ fontSize: "8px", color: "#6b7280", marginTop: 6, lineHeight: 1.6 }}>{mode.details}</div>
+                  </button>
+                );
+              })}
             </div>
 
-            <div style={{ display: "flex", flexWrap: "wrap", gap: 10 }}>
-              {PAPER_PHASES.map(phase => (
-                <div key={phase.key} style={{ ...cardStyle, marginTop: 0, flex: "1 1 290px", borderLeft: `4px solid ${phase.tint}`, background: "#fff" }}>
+            {paperView === "run" ? (
+              <>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 10 }}>
+                  <div style={{ ...cardStyle, marginTop: 0, flex: "1 1 340px", borderLeft: "4px solid #1F6C8C", background: "#F7FBFD" }}>
+                    <div style={{ fontWeight: "bold", fontSize: "11px", marginBottom: 4 }}>Implementation Guide</div>
+                    <div style={{ fontSize: "9px", lineHeight: 1.7, color: "#4b5563" }}>
+                      The shareable team doc lives at <code>PAPER_EVAL_IMPLEMENTATION.md</code>. The standard runner is <code>paper_eval_runner.py</code>, and the all-scenarios batch runner is <code>paper_eval_campaign.py</code>.
+                    </div>
+                    <div style={{ fontSize: "9px", marginTop: 6, color: "#0f4c5c" }}>
+                      Exact active windows: <b>60s</b> and <b>120s</b>. The all-together flow treats <b>1 batch</b> as <b>Baseline + Tornado + Stress</b>.
+                    </div>
+                  </div>
+                  <div style={{ ...cardStyle, marginTop: 0, flex: "1 1 320px", borderLeft: "4px solid #B45309", background: "#FFF9F1" }}>
+                    <div style={{ fontWeight: "bold", fontSize: "11px", marginBottom: 4 }}>What Run Evaluation Means</div>
+                    <div style={{ fontSize: "9px", lineHeight: 1.7, color: "#5b4636" }}>
+                      Choose this when you want to start a fresh run. The terminal command will create new HTML dashboards and TSV files.
+                    </div>
+                    <div style={{ fontSize: "8px", color: "#8b6b4a", marginTop: 6, lineHeight: 1.6 }}>
+                      You will see: command blocks, scenario timing, what each run creates, and which dashboard to open after it finishes.
+                    </div>
+                  </div>
+                  <div style={{ ...cardStyle, marginTop: 0, flex: "1 1 320px", borderLeft: "4px solid #2E7D32", background: "#F8FCF8" }}>
+                    <div style={{ fontWeight: "bold", fontSize: "11px", marginBottom: 4 }}>Same-Computer Smoke Test</div>
+                    <div style={{ fontSize: "9px", lineHeight: 1.7, color: "#355E3B" }}>
+                      One laptop is enough for implementation, evaluation, and validation. Use this short run before the full <code>60s</code> or <code>120s</code> suites.
+                    </div>
+                    <div style={{ marginTop: 7, padding: "5px 6px", background: "#eef8ee", borderRadius: 3 }}>
+                      <code style={{ display: "block", whiteSpace: "pre-wrap", overflowWrap: "anywhere", fontSize: "9px", lineHeight: 1.5 }}>
+                        {PAPER_SMOKE_COMMAND}
+                      </code>
+                    </div>
+                  </div>
+                </div>
+
+                <div style={{ ...cardStyle, marginTop: 0, borderLeft: "4px solid #1F6C8C", background: "#F7FBFD" }}>
                   <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "baseline" }}>
-                    <div style={{ fontWeight: "bold", fontSize: "11px", color: phase.tint }}>{phase.title}</div>
-                    <span style={{ fontSize: "8px", color: "#777", fontFamily: "monospace" }}>{phase.challenge}</span>
+                    <div style={{ fontWeight: "bold", fontSize: "11px", color: "#1F6C8C" }}>All Scenarios Together</div>
+                    <span style={{ fontSize: "8px", color: "#1F6C8C", fontFamily: "monospace" }}>recommended</span>
                   </div>
                   <div style={{ fontSize: "9px", color: "#444", marginTop: 5, lineHeight: 1.7 }}>
-                    <div><b>Focus:</b> {phase.focus}</div>
-                    <div><b>Scenario:</b> {phase.behavior}</div>
+                    <div><b>What it does:</b> Runs <b>Baseline</b>, <b>Tornado</b>, and <b>Ghost Outage + Noise</b> as one batch.</div>
+                    <div><b>How to count it:</b> <b>1 batch</b> means one full pass of all three scenarios. If you want 30 total all-together repetitions, run <b>30 batches</b>.</div>
+                    <div><b>What you will see:</b> A campaign dashboard with one row per scenario per batch, plus links into each scenario dashboard.</div>
                   </div>
-                  <div style={{ marginTop: 7, padding: "5px 6px", background: "#f8f8f8", borderRadius: 3 }}>
-                    <div style={{ fontSize: "8px", color: "#666", marginBottom: 2 }}>60s command</div>
-                    <code style={{ display: "block", whiteSpace: "pre-wrap", overflowWrap: "anywhere", fontSize: "9px", lineHeight: 1.5 }}>
-                      python3 paper_eval_runner.py --spec {phase.spec60}
-                    </code>
-                  </div>
-                  <div style={{ marginTop: 6, padding: "5px 6px", background: "#f8f8f8", borderRadius: 3 }}>
-                    <div style={{ fontSize: "8px", color: "#666", marginBottom: 2 }}>120s command</div>
-                    <code style={{ display: "block", whiteSpace: "pre-wrap", overflowWrap: "anywhere", fontSize: "9px", lineHeight: 1.5 }}>
-                      python3 paper_eval_runner.py --spec {phase.spec120}
-                    </code>
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 10, marginTop: 8 }}>
+                    <div style={{ flex: "1 1 280px", padding: "5px 6px", background: "#fff", borderRadius: 3, border: "1px solid #d8e1e8" }}>
+                      <div style={{ fontSize: "8px", color: "#666", marginBottom: 2 }}>60s batch command</div>
+                      <code style={{ display: "block", whiteSpace: "pre-wrap", overflowWrap: "anywhere", fontSize: "9px", lineHeight: 1.5 }}>
+                        {PAPER_CAMPAIGN_60_COMMAND}
+                      </code>
+                    </div>
+                    <div style={{ flex: "1 1 280px", padding: "5px 6px", background: "#fff", borderRadius: 3, border: "1px solid #d8e1e8" }}>
+                      <div style={{ fontSize: "8px", color: "#666", marginBottom: 2 }}>120s batch command</div>
+                      <code style={{ display: "block", whiteSpace: "pre-wrap", overflowWrap: "anywhere", fontSize: "9px", lineHeight: 1.5 }}>
+                        {PAPER_CAMPAIGN_120_COMMAND}
+                      </code>
+                    </div>
+                    <div style={{ flex: "1 1 280px", padding: "5px 6px", background: "#fff", borderRadius: 3, border: "1px solid #d8e1e8" }}>
+                      <div style={{ fontSize: "8px", color: "#666", marginBottom: 2 }}>Full 30-batch command</div>
+                      <code style={{ display: "block", whiteSpace: "pre-wrap", overflowWrap: "anywhere", fontSize: "9px", lineHeight: 1.5 }}>
+                        {PAPER_CAMPAIGN_FULL_COMMAND}
+                      </code>
+                    </div>
                   </div>
                 </div>
-              ))}
-            </div>
 
-            <div style={{ ...cardStyle, marginTop: 0, borderLeft: "4px solid #2E7D32", background: "#F8FCF8" }}>
-              <div style={{ fontWeight: "bold", fontSize: "11px", marginBottom: 4 }}>Push Checklist</div>
-              <div style={{ display: "flex", flexWrap: "wrap", gap: 10 }}>
-                {PUSH_READY_ITEMS.map(item => (
-                  <div key={item} style={{ flex: "1 1 240px", fontSize: "9px", lineHeight: 1.7, color: "#355E3B" }}>
-                    - {item}
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 10 }}>
+                  {PAPER_PHASES.map(phase => (
+                    <div key={phase.key} style={{ ...cardStyle, marginTop: 0, flex: "1 1 290px", borderLeft: `4px solid ${phase.tint}`, background: "#fff" }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "baseline" }}>
+                        <div style={{ fontWeight: "bold", fontSize: "11px", color: phase.tint }}>{phase.title}</div>
+                        <span style={{ fontSize: "8px", color: "#777", fontFamily: "monospace" }}>{phase.challenge}</span>
+                      </div>
+                      <div style={{ fontSize: "9px", color: "#444", marginTop: 5, lineHeight: 1.7 }}>
+                        <div><b>Focus:</b> {phase.focus}</div>
+                        <div><b>Scenario:</b> {phase.behavior}</div>
+                        <div><b>What you will see:</b> A single scenario suite dashboard plus deep-dive run pages for that scenario only.</div>
+                      </div>
+                      <div style={{ marginTop: 7, padding: "5px 6px", background: "#f8f8f8", borderRadius: 3 }}>
+                        <div style={{ fontSize: "8px", color: "#666", marginBottom: 2 }}>60s command</div>
+                        <code style={{ display: "block", whiteSpace: "pre-wrap", overflowWrap: "anywhere", fontSize: "9px", lineHeight: 1.5 }}>
+                          python3 paper_eval_runner.py --spec {phase.spec60}
+                        </code>
+                      </div>
+                      <div style={{ marginTop: 6, padding: "5px 6px", background: "#f8f8f8", borderRadius: 3 }}>
+                        <div style={{ fontSize: "8px", color: "#666", marginBottom: 2 }}>120s command</div>
+                        <code style={{ display: "block", whiteSpace: "pre-wrap", overflowWrap: "anywhere", fontSize: "9px", lineHeight: 1.5 }}>
+                          python3 paper_eval_runner.py --spec {phase.spec120}
+                        </code>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+
+                <div style={{ ...cardStyle, marginTop: 0, borderLeft: "4px solid #2E7D32", background: "#F8FCF8" }}>
+                  <div style={{ fontWeight: "bold", fontSize: "11px", marginBottom: 4 }}>Push Checklist</div>
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 10 }}>
+                    {PUSH_READY_ITEMS.map(item => (
+                      <div key={item} style={{ flex: "1 1 240px", fontSize: "9px", lineHeight: 1.7, color: "#355E3B" }}>
+                        - {item}
+                      </div>
+                    ))}
                   </div>
-                ))}
-              </div>
-            </div>
+                </div>
+              </>
+            ) : (
+              <>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 10 }}>
+                  <div style={{ ...cardStyle, marginTop: 0, flex: "1 1 320px", borderLeft: "4px solid #9E2A2B", background: "#FFF7F7" }}>
+                    <div style={{ fontWeight: "bold", fontSize: "11px", marginBottom: 4 }}>What View Reports Means</div>
+                    <div style={{ fontSize: "9px", lineHeight: 1.7, color: "#5f3737" }}>
+                      Choose this when you do <b>not</b> want to start anything new. You are only opening finished HTML dashboards and raw files.
+                    </div>
+                    <div style={{ fontSize: "8px", color: "#8c5a5a", marginTop: 6, lineHeight: 1.6 }}>
+                      You will see: protocol comparison tables, scenario filters, suite averages, node spotlight pages, pull history, and exports for Excel.
+                    </div>
+                  </div>
+                  <div style={{ ...cardStyle, marginTop: 0, flex: "1 1 320px", borderLeft: "4px solid #B45309", background: "#FFF9F1" }}>
+                    <div style={{ fontWeight: "bold", fontSize: "11px", marginBottom: 4 }}>What The Reports Show</div>
+                    <div style={{ fontSize: "9px", lineHeight: 1.7, color: "#5b4636" }}>
+                      Campaign dashboards summarize batches, scenario suite dashboards compare runs of one scenario, and run dashboards let you inspect one node or one watched pair in detail.
+                    </div>
+                    <div style={{ fontSize: "8px", color: "#8b6b4a", marginTop: 6, lineHeight: 1.6 }}>
+                      Use campaign first, then scenario suite, then single run if you need a deeper explanation for one node or one event path.
+                    </div>
+                  </div>
+                  <div style={{ ...cardStyle, marginTop: 0, flex: "1 1 340px", borderLeft: "4px solid #1F6C8C", background: "#F7FBFD" }}>
+                    <div style={{ fontWeight: "bold", fontSize: "11px", marginBottom: 4 }}>Saved Outputs</div>
+                    <div style={{ fontSize: "9px", lineHeight: 1.7, color: "#4b5563" }}>
+                      {PAPER_OUTPUTS.map(path => (
+                        <div key={path}><code>{path}</code></div>
+                      ))}
+                    </div>
+                    <div style={{ fontSize: "8px", color: "#0f4c5c", marginTop: 6 }}>
+                      TSV outputs paste cleanly into Excel for color-coded scorecards and grouped figures.
+                    </div>
+                  </div>
+                </div>
+
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 10 }}>
+                  {PAPER_REPORT_SURFACES.map(surface => (
+                    <div key={surface.key} style={{ ...cardStyle, marginTop: 0, flex: "1 1 290px", borderLeft: `4px solid ${surface.tint}`, background: "#fff" }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "baseline" }}>
+                        <div style={{ fontWeight: "bold", fontSize: "11px", color: surface.tint }}>{surface.title}</div>
+                        <span style={{ fontSize: "8px", color: "#777", fontFamily: "monospace" }}>open latest</span>
+                      </div>
+                      <div style={{ fontSize: "9px", color: "#444", marginTop: 5, lineHeight: 1.7 }}>
+                        <div><b>When to use it:</b> {surface.description}</div>
+                        <div><b>What you will see:</b> {surface.shows}</div>
+                      </div>
+                      <div style={{ marginTop: 7, padding: "5px 6px", background: "#f8f8f8", borderRadius: 3 }}>
+                        <div style={{ fontSize: "8px", color: "#666", marginBottom: 2 }}>Open command</div>
+                        <code style={{ display: "block", whiteSpace: "pre-wrap", overflowWrap: "anywhere", fontSize: "9px", lineHeight: 1.5 }}>
+                          {surface.command}
+                        </code>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+
+                <div style={{ ...cardStyle, marginTop: 0, borderLeft: "4px solid #1F6C8C", background: "#F7FBFD" }}>
+                  <div style={{ fontWeight: "bold", fontSize: "11px", marginBottom: 4 }}>Reading Order</div>
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 10 }}>
+                    <div style={{ flex: "1 1 220px", fontSize: "9px", lineHeight: 1.7, color: "#274c5e" }}>
+                      <b>1.</b> Start with the campaign dashboard if you ran the all-together batch.
+                    </div>
+                    <div style={{ flex: "1 1 220px", fontSize: "9px", lineHeight: 1.7, color: "#274c5e" }}>
+                      <b>2.</b> Open the scenario suite dashboard to use comparison tabs like <code>All</code>, <code>Baseline</code>, and <code>Tornado</code>.
+                    </div>
+                    <div style={{ flex: "1 1 220px", fontSize: "9px", lineHeight: 1.7, color: "#274c5e" }}>
+                      <b>3.</b> Open a single run page when you want <code>Node Spotlight</code>, pull history, or the all-node raw table.
+                    </div>
+                  </div>
+                </div>
+              </>
+            )}
           </div>
         )}
       </div>
