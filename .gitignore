@@ -13,4 +13,6 @@ __pycache__/
 # Local runs / temp outputs
 runs/
 paper_reports/
+campaign_reports/
+external/
 *.log
