@@ -60,7 +60,7 @@ def listener(config_json, node_state, state_lock, this_port, number_of_nodes, pu
         msg = request.get_json()
         return listener_protocol.listener_protocol(config_json, node_state, state_lock, this_port, number_of_nodes, push_queue, msg)
 
-    app.run(host=config_json["base_host"], port=this_port)
+    app.run(host=config_json["base_host"], port=this_port, debug=False, use_reloader=False, threaded=True)
 
 
 def background(config_json, node_state, state_lock, this_port, number_of_nodes, push_queue):
@@ -113,6 +113,14 @@ def main():
 
     with open(config_file) as file:
         config_json = json.load(file)
+
+    env_base_host = os.environ.get("EGESS_BASE_HOST", "").strip()
+    if env_base_host:
+        config_json["base_host"] = env_base_host
+
+    env_base_port = os.environ.get("EGESS_BASE_PORT", "").strip()
+    if env_base_port.isdigit():
+        config_json["base_port"] = int(env_base_port)
 
     with open(node_state_init_file) as file:
         node_state = json.load(file)
@@ -182,6 +190,14 @@ def main():
     node_state.setdefault("incoming_events", [])
     node_state.setdefault("seen_event_ids", [])
     node_state.setdefault("recent_alerts", [])
+    node_state.setdefault("layer1_alert", {})
+    node_state.setdefault("layer2_confirmation", {})
+    node_state.setdefault("last_layer1_rx", {})
+    node_state.setdefault("last_layer2_rx", {})
+    node_state.setdefault("prev_alert_code", 0)
+    node_state.setdefault("tomo_distance_history", [])
+    node_state.setdefault("last_published_layer1_signature", "")
+    node_state.setdefault("last_published_layer2_signature", "")
     node_state.setdefault("last_cycle_ts", 0.0)
     node_state.setdefault("last_state_change_ts", 0.0)
     node_state.setdefault("pull_cycles", 0)

@@ -31,9 +31,9 @@ ROOT_DIR = Path(__file__).resolve().parent
 COMPARISON_REPORTS_DIR = ROOT_DIR / "comparison_reports"
 SCENARIO_ORDER = ["Baseline", "Fire", "Tornado", "Ghost Outage + Noise"]
 METRIC_SPECS = [
-    ("avg_total_mb", "Traffic (MB)", True, "#ff7a59"),
+    ("avg_total_mb", "Overhead (MB)", True, "#ff7a59"),
     ("avg_failures", "Failures / Run", True, "#c73a3a"),
-    ("avg_detection_speed_sec", "Detection Speed", True, "#2474e5"),
+    ("avg_detection_speed_sec", "Detection Latency", True, "#2474e5"),
     ("avg_false_positive_nodes", "False Positives", True, "#8b4cd6"),
     ("avg_false_unavailable_refs", "False Unavailable Refs", True, "#c58f10"),
     ("avg_settle_accuracy_pct", "Settle Accuracy", False, "#118a7e"),
@@ -172,7 +172,7 @@ def _build_overview_rows(egess_suites, checkin_suites):
                     checkin_metrics.get("avg_failures") if checkin_metrics else None,
                     lower_is_better=True,
                 ),
-                "speed_winner": _winner_callout(
+                "detection_latency_winner": _winner_callout(
                     egess_metrics.get("avg_detection_speed_sec") if egess_metrics else None,
                     checkin_metrics.get("avg_detection_speed_sec") if checkin_metrics else None,
                     lower_is_better=True,
@@ -373,7 +373,7 @@ def _render_overview_section(rows):
         "checkin_setup",
         "bytes_winner",
         "failures_winner",
-        "speed_winner",
+        "detection_latency_winner",
         "false_positive_winner",
         "false_unavailable_winner",
         "accuracy_winner",
@@ -414,7 +414,7 @@ def main():
             "checkin_setup",
             "bytes_winner",
             "failures_winner",
-            "speed_winner",
+            "detection_latency_winner",
             "false_positive_winner",
             "false_unavailable_winner",
             "accuracy_winner",

@@ -82,17 +82,17 @@ fi
 
 cleanup() {
   if [[ "$KEEP_RUNNING" -eq 0 ]]; then
-    ./stop_nodes.sh >/dev/null 2>&1 || true
+    ./stop_nodes.sh --base-port "$BASE_PORT" >/dev/null 2>&1 || true
   fi
 }
 trap cleanup EXIT
 
-echo "Stopping any existing nodes..."
-./stop_nodes.sh >/dev/null 2>&1 || true
+echo "Stopping any existing nodes on base port $BASE_PORT..."
+./stop_nodes.sh --base-port "$BASE_PORT" >/dev/null 2>&1 || true
 
-echo "Starting $NODES nodes with EGESS_LOG=1..."
-EGESS_LOG=1 ./start_nodes.sh "$NODES"
-RUN_DIR="$(ls -1dt runs/* | head -n 1)"
+echo "Starting $NODES nodes on base port $BASE_PORT with EGESS_LOG=${EGESS_LOG:-0}..."
+EGESS_NODE_LOG_MAX_BYTES="${EGESS_NODE_LOG_MAX_BYTES:-16384}" EGESS_LOG="${EGESS_LOG:-0}" ./start_nodes.sh --base-port "$BASE_PORT" "$NODES"
+RUN_DIR="$(ls -1dt runs/*_p"${BASE_PORT}" | head -n 1)"
 if [[ -z "$RUN_DIR" ]]; then
   echo "ERROR: Could not determine run directory."
   exit 1

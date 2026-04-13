@@ -14,6 +14,9 @@ STATE_BOUNDARY = 3
 
 SECTOR_COUNT = 6
 ACTIVE_STATES = ("WATCH", "WARNING", "IMPACT", "STALLED", "CONTAINED", "RECOVERING")
+ALERT_BITS = {0: "00", 1: "01", 2: "10", 3: "11"}
+ALERT_LEVELS = {0: "NORMAL", 1: "WATCH", 2: "WARNING", 3: "IMPACT"}
+DIR_LABELS = {0: "", 1: "E", 2: "NE", 3: "NW", 4: "W", 5: "SW", 6: "SE"}
 
 
 def _to_int(value, fallback):
@@ -51,6 +54,58 @@ def _score_trend(delta):
 
 def _empty_sector_map():
     return {str(i): 0.0 for i in range(1, SECTOR_COUNT + 1)}
+
+
+def _empty_tomography():
+    return {
+        "absence_vector": [0, 0, 0, 0, 0, 0],
+        "t_gradient": [0, 0, 0, 0, 0, 0],
+        "delta_bits": [0, 0, 0, 0, 0, 0],
+        "direction_sector": 0,
+        "direction_label": "",
+        "angle_deg": 0.0,
+        "sin_sum": 0.0,
+        "cos_sum": 0.0,
+        "distance_hops": 99.0,
+        "speed_hops_per_cycle": 0.0,
+        "eta_cycles": 99.0,
+        "phase": "CLEAR",
+        "strength": 0.0,
+        "message": "No directional confirmation",
+    }
+
+
+def _alert_code(protocol_state, score):
+    state = str(protocol_state).strip().upper()
+    if state == "IMPACT":
+        return 3
+    if state == "WARNING":
+        return 2
+    if state in ("WATCH", "STALLED", "CONTAINED", "RECOVERING"):
+        return 1 if float(score) > 0.0 or state != "NORMAL" else 0
+    return 0
+
+
+def _alert_bits(code):
+    return str(ALERT_BITS.get(int(code), "00"))
+
+
+def _alert_level(code):
+    return str(ALERT_LEVELS.get(int(code), "NORMAL"))
+
+
+def _alert_delta_bits(current_code, previous_code):
+    current_value = int(current_code)
+    diff = int(current_code) - int(previous_code)
+    if current_value <= 0 and diff <= 0:
+        return 0
+    if diff >= 2:
+        return 3
+    if diff == 1:
+        return 2
+    if current_value > 0:
+        return 1
+    return 0
 
 
 def _port_to_rc(base_port, port, grid):
@@ -216,6 +271,149 @@ def _count_by_sector(config_json, node_state, this_port, ports):
     return counts
 
 
+def _neighbor_alert_snapshot(snapshot):
+    if not isinstance(snapshot, dict):
+        return 0, 0
+
+    layer1 = snapshot.get("layer1_alert", {})
+    if isinstance(layer1, dict) and len(layer1) > 0:
+        code = _to_int(layer1.get("alert_code", 0), 0)
+        delta_bits = _to_int(layer1.get("delta_bits", 0), 0)
+        return max(0, min(code, 3)), max(0, min(delta_bits, 3))
+
+    code = _alert_code(snapshot.get("protocol_state", "NORMAL"), snapshot.get("score", 0.0))
+    score_delta = _to_float(snapshot.get("score_delta", 0.0), 0.0)
+    if code <= 0:
+        delta_bits = 0
+    elif score_delta >= 2.0:
+        delta_bits = 3
+    elif score_delta > 0.0:
+        delta_bits = 2
+    else:
+        delta_bits = 1
+    return max(0, min(code, 3)), max(0, min(delta_bits, 3))
+
+
+def _compute_tomography(config_json, node_state, this_port, neighbors, snapshots, current_missing):
+    result = _empty_tomography()
+    absence_vector = [0, 0, 0, 0, 0, 0]
+    t_gradient = [0, 0, 0, 0, 0, 0]
+    delta_bits = [0, 0, 0, 0, 0, 0]
+
+    for neighbor in neighbors:
+        sector = _sector_for_port(config_json, node_state, this_port, int(neighbor))
+        if sector < 1 or sector > SECTOR_COUNT:
+            continue
+        idx = int(sector) - 1
+        if int(neighbor) in current_missing:
+            absence_vector[idx] = 1
+            t_gradient[idx] = 3
+            delta_bits[idx] = 3
+            continue
+
+        code, delta = _neighbor_alert_snapshot(snapshots.get(int(neighbor), {}))
+        t_gradient[idx] = max(int(t_gradient[idx]), int(code))
+        delta_bits[idx] = max(int(delta_bits[idx]), int(delta))
+
+    sin_sum = 0.0
+    cos_sum = 0.0
+    total_weight = 0.0
+    for idx in range(SECTOR_COUNT):
+        angle = math.radians(float(idx) * 60.0)
+        weight = 5.0 * float(absence_vector[idx]) + float(t_gradient[idx]) + 0.5 * float(delta_bits[idx])
+        sin_sum += weight * math.sin(angle)
+        cos_sum += weight * math.cos(angle)
+        total_weight += weight
+
+    direction_sector = 0
+    direction_label = ""
+    angle_deg = 0.0
+    if total_weight > 0.0:
+        angle_deg = (math.degrees(math.atan2(sin_sum, cos_sum)) + 360.0) % 360.0
+        direction_sector = int(round(angle_deg / 60.0)) % 6 + 1
+        direction_label = DIR_LABELS.get(int(direction_sector), "")
+
+    max_gradient = max([int(x) for x in t_gradient] + [0])
+    distance_hops = 99.0
+    if max_gradient > 0:
+        distance_hops = round(12.0 / float(max_gradient), 1)
+
+    prev_history = node_state.get("tomo_distance_history", [])
+    if not isinstance(prev_history, list):
+        prev_history = []
+    dist_history = list(prev_history[-3:])
+    dist_history.append(float(distance_hops))
+
+    valid_history = [float(x) for x in dist_history if float(x) < 90.0]
+    speed_hops_per_cycle = 0.0
+    if len(valid_history) >= 2:
+        speed_hops_per_cycle = round((float(valid_history[0]) - float(valid_history[-1])) / float(len(valid_history) - 1), 1)
+
+    eta_cycles = 99.0
+    if speed_hops_per_cycle > 0.0 and float(distance_hops) < 90.0:
+        eta_cycles = round(float(distance_hops) / float(speed_hops_per_cycle), 1)
+
+    prev_vector = node_state.get("layer2_confirmation", {}).get("absence_vector", [0, 0, 0, 0, 0, 0])
+    if not isinstance(prev_vector, list) or len(prev_vector) != SECTOR_COUNT:
+        prev_vector = [0, 0, 0, 0, 0, 0]
+    growing = 0
+    shrinking = 0
+    for idx in range(SECTOR_COUNT):
+        if int(absence_vector[idx]) > int(prev_vector[idx]):
+            growing += 1
+        elif int(absence_vector[idx]) < int(prev_vector[idx]):
+            shrinking += 1
+
+    rising_deltas = len([x for x in delta_bits if int(x) >= 2])
+    stable_deltas = len([x for x in delta_bits if int(x) == 1])
+    phase = "CLEAR"
+    if total_weight > 0.0:
+        if sum(int(x) for x in absence_vector) > 0 and max_gradient >= 3:
+            phase = "IMPACT"
+        elif growing > 0 or rising_deltas >= 2:
+            phase = "APPROACHING"
+        elif shrinking > 0 and growing == 0:
+            phase = "RECOVERING"
+        elif stable_deltas >= 2 and rising_deltas == 0 and growing == 0:
+            phase = "CONTAINED"
+        else:
+            phase = "MONITORING"
+
+    strength = 0.0
+    strength += float(sum(int(x) for x in absence_vector)) * 2.0
+    strength += float(sum(int(x) for x in t_gradient)) * 0.3
+    strength += float(rising_deltas) * 0.5
+    strength = round(strength, 1)
+
+    if phase == "CLEAR":
+        message = "No directional confirmation"
+    else:
+        message = "{} from {} | dist={} hops | speed={} hops/cycle | eta={} cycles".format(
+            phase,
+            direction_label or "?",
+            distance_hops if distance_hops < 90.0 else "?",
+            speed_hops_per_cycle if speed_hops_per_cycle > 0.0 else 0.0,
+            eta_cycles if eta_cycles < 90.0 else "?",
+        )
+
+    result["absence_vector"] = absence_vector
+    result["t_gradient"] = t_gradient
+    result["delta_bits"] = delta_bits
+    result["direction_sector"] = int(direction_sector)
+    result["direction_label"] = str(direction_label)
+    result["angle_deg"] = round(float(angle_deg), 1)
+    result["sin_sum"] = round(float(sin_sum), 2)
+    result["cos_sum"] = round(float(cos_sum), 2)
+    result["distance_hops"] = round(float(distance_hops), 1)
+    result["speed_hops_per_cycle"] = round(float(speed_hops_per_cycle), 1)
+    result["eta_cycles"] = round(float(eta_cycles), 1)
+    result["phase"] = str(phase)
+    result["strength"] = float(strength)
+    result["message"] = str(message)
+    result["history"] = [round(float(x), 1) for x in dist_history[-4:]]
+    return result
+
+
 def _consume_events(config_json, node_state, this_port):
     events = node_state.get("incoming_events", [])
     if not isinstance(events, list):
@@ -232,8 +430,9 @@ def _consume_events(config_json, node_state, this_port):
     )
     keep_horizon = max(30.0, fresh_window * 8.0)
 
-    front_alerts = _empty_sector_map()
-    recovery_notices = _empty_sector_map()
+    front_alert_relays = {str(i): set() for i in range(1, SECTOR_COUNT + 1)}
+    confirmation_relays = {str(i): set() for i in range(1, SECTOR_COUNT + 1)}
+    recovery_notice_relays = {str(i): set() for i in range(1, SECTOR_COUNT + 1)}
     stall_notices = 0
     retained = []
 
@@ -253,30 +452,49 @@ def _consume_events(config_json, node_state, this_port):
         relay = event.get("relay", event.get("origin", 0))
         sector = _sector_for_port(config_json, node_state, this_port, relay)
 
-        if event_type == "front_alert" and 1 <= int(sector) <= SECTOR_COUNT:
-            front_alerts[str(int(sector))] = float(front_alerts.get(str(int(sector)), 0.0)) + 1.0
+        sector_key = str(int(sector))
+        relay_key = _to_int(relay, 0)
+
+        if event_type in ("front_alert", "alert_state") and 1 <= int(sector) <= SECTOR_COUNT:
+            front_alert_relays[sector_key].add(relay_key)
+        elif event_type == "confirmation_notice" and 1 <= int(sector) <= SECTOR_COUNT:
+            phase = str(event.get("phase", event.get("state", ""))).strip().upper()
+            if phase == "RECOVERING":
+                recovery_notice_relays[sector_key].add(relay_key)
+            else:
+                confirmation_relays[sector_key].add(relay_key)
         elif event_type == "recovery_notice" and 1 <= int(sector) <= SECTOR_COUNT:
-            recovery_notices[str(int(sector))] = float(recovery_notices.get(str(int(sector)), 0.0)) + 1.0
+            recovery_notice_relays[sector_key].add(relay_key)
         elif event_type == "stall_notice":
             stall_notices += 1
 
     node_state["incoming_events"] = retained[-120:]
-    return front_alerts, recovery_notices, int(stall_notices)
+    front_alerts = {key: float(len(value)) for key, value in front_alert_relays.items()}
+    confirmation_alerts = {key: float(len(value)) for key, value in confirmation_relays.items()}
+    recovery_notices = {key: float(len(value)) for key, value in recovery_notice_relays.items()}
+    return front_alerts, confirmation_alerts, recovery_notices, int(stall_notices)
 
 
-def _front_scores(new_missing_by_sector, persistent_by_sector, alert_by_sector, recovery_by_sector, history):
+def _front_scores(new_missing_by_sector, persistent_by_sector, alert_by_sector, confirmation_by_sector, recovery_by_sector, history):
     scores = _empty_sector_map()
     updated_history = list(history[-2:]) if isinstance(history, list) else []
 
     for sector in range(1, SECTOR_COUNT + 1):
         key = str(sector)
+        alert_count = float(alert_by_sector.get(key, 0.0))
+        confirm_count = float(confirmation_by_sector.get(key, 0.0))
+        disagreement = 1.0 if alert_count > 0.0 else 0.0
+        corroboration = 1.0 if alert_count > 1.0 else 0.0
+        confirmation_bonus = min(1.0, 0.5 * float(confirm_count))
         raw_value = (
             2.0 * float(new_missing_by_sector.get(key, 0.0)) +
-            1.0 * float(alert_by_sector.get(key, 0.0)) +
+            float(disagreement) +
+            float(corroboration) +
+            float(confirmation_bonus) +
             0.5 * float(persistent_by_sector.get(key, 0.0)) -
             1.0 * float(recovery_by_sector.get(key, 0.0))
         )
-        if sector in updated_history and updated_history.count(sector) >= 2:
+        if raw_value > 0.0 and sector in updated_history and updated_history.count(sector) >= 2:
             raw_value += 1.0
         scores[key] = max(0.0, float(raw_value))
     return scores
@@ -345,6 +563,24 @@ def _publish_notice(config_json, node_state, state_lock, this_port, push_queue, 
     _queue_event(node_state, state_lock, push_queue, msg)
 
 
+def _publish_local_layer_message(node_state, state_lock, this_port, push_queue, neighbors, notice_type, payload):
+    msg = {
+        "op": "push",
+        "data": dict(payload),
+        "metadata": {
+            "origin": int(this_port),
+            "relay": int(this_port),
+            "forward_count": 0,
+            "targets": [int(x) for x in neighbors if isinstance(x, int) and int(x) != int(this_port)],
+            "no_forward": True,
+        },
+    }
+    msg["data"]["type"] = str(notice_type)
+    msg["data"]["event_id"] = _event_id(node_state, notice_type, this_port)
+    msg["data"]["ts"] = float(time.time())
+    _queue_event(node_state, state_lock, push_queue, msg)
+
+
 def pull_protocol(config_json, node_state, state_lock, this_port, number_of_nodes, push_queue):
     state_lock.acquire()
     try:
@@ -363,6 +599,9 @@ def pull_protocol(config_json, node_state, state_lock, this_port, number_of_node
             history = []
         sensor_state = str(node_state.get("sensor_state", "NORMAL")).strip().upper()
         started_ts = _to_float(node_state.get("started_ts", 0.0), 0.0)
+        prev_alert_code = _to_int(node_state.get("prev_alert_code", 0), 0)
+        prev_layer1_signature = str(node_state.get("last_published_layer1_signature", ""))
+        prev_layer2_signature = str(node_state.get("last_published_layer2_signature", ""))
     finally:
         state_lock.release()
 
@@ -383,7 +622,7 @@ def pull_protocol(config_json, node_state, state_lock, this_port, number_of_node
         node_state["neighbor_states"] = transitions["next_states"]
         node_state["neighbor_miss_streak"] = transitions["next_streak"]
 
-        incoming_front_alerts, incoming_recovery_notices, stall_notices = _consume_events(
+        incoming_front_alerts, incoming_confirmation_alerts, incoming_recovery_notices, stall_notices = _consume_events(
             config_json=config_json,
             node_state=node_state,
             this_port=this_port,
@@ -412,6 +651,7 @@ def pull_protocol(config_json, node_state, state_lock, this_port, number_of_node
         new_missing_by_sector=new_missing_by_sector,
         persistent_by_sector=persistent_by_sector,
         alert_by_sector=incoming_front_alerts,
+        confirmation_by_sector=incoming_confirmation_alerts,
         recovery_by_sector=combined_recovery_by_sector,
         history=history,
     )
@@ -424,13 +664,22 @@ def pull_protocol(config_json, node_state, state_lock, this_port, number_of_node
     if int(dominant_sector) > 0:
         front_score = float(front_score_by_sector.get(str(int(dominant_sector)), 0.0))
 
-    active_sectors = _sector_keys_with_signal(new_missing_by_sector, persistent_by_sector, incoming_front_alerts)
+    active_sectors = _sector_keys_with_signal(
+        new_missing_by_sector,
+        persistent_by_sector,
+        incoming_front_alerts,
+        incoming_confirmation_alerts,
+    )
     front_width = int(len(active_sectors))
 
     progression = 0
     if int(dominant_sector) > 0:
         dominant_key = str(int(dominant_sector))
-        if float(new_missing_by_sector.get(dominant_key, 0.0)) > 0.0 or float(incoming_front_alerts.get(dominant_key, 0.0)) > 0.0:
+        if (
+            float(new_missing_by_sector.get(dominant_key, 0.0)) > 0.0 or
+            float(incoming_front_alerts.get(dominant_key, 0.0)) > 0.0 or
+            float(incoming_confirmation_alerts.get(dominant_key, 0.0)) > 0.0
+        ):
             progression = 1
 
     adjacency = 1 if _has_adjacent_sectors(active_sectors) else 0
@@ -486,7 +735,11 @@ def pull_protocol(config_json, node_state, state_lock, this_port, number_of_node
     if int(prev_dominant) > 0 and not progress_event:
         for sector in _adjacent_sectors(prev_dominant):
             key = str(int(sector))
-            if float(new_missing_by_sector.get(key, 0.0)) > 0.0 or float(incoming_front_alerts.get(key, 0.0)) > 0.0:
+            if (
+                float(new_missing_by_sector.get(key, 0.0)) > 0.0 or
+                float(incoming_front_alerts.get(key, 0.0)) > 0.0 or
+                float(incoming_confirmation_alerts.get(key, 0.0)) > 0.0
+            ):
                 bypass = 1
                 break
 
@@ -564,6 +817,33 @@ def pull_protocol(config_json, node_state, state_lock, this_port, number_of_node
         boundary_kind = "recovering"
         dfa_state = STATE_VERIFY
 
+    alert_code = _alert_code(protocol_state, t_score)
+    alert_bits = _alert_bits(alert_code)
+    alert_level = _alert_level(alert_code)
+    alert_delta_bits = _alert_delta_bits(alert_code, prev_alert_code)
+    layer1_alert = {
+        "alert_code": int(alert_code),
+        "alert_bits": str(alert_bits),
+        "alert_level": str(alert_level),
+        "delta_bits": int(alert_delta_bits),
+        "cycle": int(prev_pull_cycles) + 1,
+        "score": round(float(t_score), 1),
+        "state": str(protocol_state),
+        "message": "L1 {} {} means something is happening".format(alert_bits, alert_level),
+    }
+
+    tomography = _compute_tomography(
+        config_json=config_json,
+        node_state=node_state,
+        this_port=this_port,
+        neighbors=neighbors,
+        snapshots=snapshots,
+        current_missing=current_missing,
+    )
+    tomography["cycle"] = int(prev_pull_cycles) + 1
+    tomography["state"] = str(protocol_state)
+    tomography["message"] = str(tomography.get("message", ""))
+
     state_lock.acquire()
     try:
         node_state["protocol_state"] = str(protocol_state)
@@ -598,7 +878,14 @@ def pull_protocol(config_json, node_state, state_lock, this_port, number_of_node
             "new_missing_by_sector": {k: float(v) for k, v in new_missing_by_sector.items()},
             "persistent_missing_by_sector": {k: float(v) for k, v in persistent_by_sector.items()},
             "fresh_alerts_by_sector": {k: float(v) for k, v in incoming_front_alerts.items()},
+            "confirmations_by_sector": {k: float(v) for k, v in incoming_confirmation_alerts.items()},
             "recovery_by_sector": {k: float(v) for k, v in combined_recovery_by_sector.items()},
+            "dominant_new_missing": float(new_missing_by_sector.get(str(int(dominant_sector)), 0.0)) if int(dominant_sector) > 0 else 0.0,
+            "dominant_persistent_missing": float(persistent_by_sector.get(str(int(dominant_sector)), 0.0)) if int(dominant_sector) > 0 else 0.0,
+            "dominant_disagreement": 1 if int(dominant_sector) > 0 and float(incoming_front_alerts.get(str(int(dominant_sector)), 0.0)) > 0.0 else 0,
+            "dominant_corroboration": 1 if int(dominant_sector) > 0 and float(incoming_front_alerts.get(str(int(dominant_sector)), 0.0)) > 1.0 else 0,
+            "dominant_confirmation": float(incoming_confirmation_alerts.get(str(int(dominant_sector)), 0.0)) if int(dominant_sector) > 0 else 0.0,
+            "dominant_momentum": 1 if int(dominant_sector) > 0 and updated_history.count(int(dominant_sector)) >= 2 and float(front_score) > 0.0 else 0,
         }
         node_state["impact_components"] = {
             "adjacent_new_missing": int(len(new_missing)),
@@ -618,6 +905,10 @@ def pull_protocol(config_json, node_state, state_lock, this_port, number_of_node
             "bypass": int(bypass),
             "reactivation": int(reactivation),
         }
+        node_state["layer1_alert"] = dict(layer1_alert)
+        node_state["layer2_confirmation"] = dict(tomography)
+        node_state["prev_alert_code"] = int(alert_code)
+        node_state["tomo_distance_history"] = [round(float(x), 1) for x in tomography.get("history", [])]
         node_state["last_cycle_ts"] = float(time.time())
         node_state["pull_cycles"] = int(prev_pull_cycles) + 1
         if str(protocol_state) != str(prev_state):
@@ -625,8 +916,57 @@ def pull_protocol(config_json, node_state, state_lock, this_port, number_of_node
     finally:
         state_lock.release()
 
+    layer1_signature = "{}|{}|{}".format(
+        layer1_alert.get("alert_bits", "00"),
+        layer1_alert.get("alert_level", "NORMAL"),
+        layer1_alert.get("cycle", 0),
+    )
+    layer2_signature = "{}|{}|{}|{}|{}".format(
+        tomography.get("phase", "CLEAR"),
+        tomography.get("direction_label", ""),
+        tomography.get("distance_hops", 99.0),
+        tomography.get("speed_hops_per_cycle", 0.0),
+        tomography.get("eta_cycles", 99.0),
+    )
+
     if within_startup_grace:
         return
+
+    if layer1_signature != prev_layer1_signature and int(alert_code) > 0:
+        _publish_local_layer_message(
+            node_state=node_state,
+            state_lock=state_lock,
+            this_port=this_port,
+            push_queue=push_queue,
+            neighbors=neighbors,
+            notice_type="alert_state",
+            payload=layer1_alert,
+        )
+        state_lock.acquire()
+        try:
+            node_state["last_published_layer1_signature"] = str(layer1_signature)
+        finally:
+            state_lock.release()
+
+    if (
+        layer2_signature != prev_layer2_signature and
+        str(tomography.get("phase", "CLEAR")) != "CLEAR" and
+        float(tomography.get("strength", 0.0)) > 0.0
+    ):
+        _publish_local_layer_message(
+            node_state=node_state,
+            state_lock=state_lock,
+            this_port=this_port,
+            push_queue=push_queue,
+            neighbors=neighbors,
+            notice_type="confirmation_notice",
+            payload=tomography,
+        )
+        state_lock.acquire()
+        try:
+            node_state["last_published_layer2_signature"] = str(layer2_signature)
+        finally:
+            state_lock.release()
 
     if str(protocol_state) in ("WATCH", "WARNING", "IMPACT") and (
         progress_event or _state_rank(protocol_state) > _state_rank(prev_state)

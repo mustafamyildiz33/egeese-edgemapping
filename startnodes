@@ -4,6 +4,7 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 NODES=16
+BASE_PORT="${EGESS_BASE_PORT:-9000}"
 GRID=""
 AUTO_DEMO="off"
 AUTO_PERIOD=10
@@ -14,6 +15,10 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --nodes)
       NODES="$2"
+      shift 2
+      ;;
+    --base-port)
+      BASE_PORT="$2"
       shift 2
       ;;
     --grid)
@@ -38,7 +43,7 @@ while [[ $# -gt 0 ]]; do
       ;;
     *)
       echo "Unknown argument: $1"
-      echo "Usage: ./startnodes [--nodes N] [--grid G] [--auto-demo off|firebomb|spread|tornado|dual] [--auto-period SEC] [--no-stop-on-exit] [--no-visualizer]"
+      echo "Usage: ./startnodes [--nodes N] [--base-port PORT] [--grid G] [--auto-demo off|firebomb|spread|tornado|dual] [--auto-period SEC] [--no-stop-on-exit] [--no-visualizer]"
       exit 1
       ;;
   esac
@@ -46,6 +51,11 @@ done
 
 if ! [[ "$NODES" =~ ^[0-9]+$ ]] || [[ "$NODES" -lt 2 ]]; then
   echo "ERROR: --nodes must be an integer >= 2"
+  exit 1
+fi
+
+if ! [[ "$BASE_PORT" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: --base-port must be an integer"
   exit 1
 fi
 
@@ -80,7 +90,7 @@ fi
 
 cleanup() {
   if [[ "$STOP_ON_EXIT" -eq 1 ]]; then
-    ./stop_nodes.sh >/dev/null 2>&1 || true
+    ./stop_nodes.sh --base-port "$BASE_PORT" >/dev/null 2>&1 || true
   fi
 }
 
@@ -88,22 +98,22 @@ if [[ "$STOP_ON_EXIT" -eq 1 ]]; then
   trap cleanup EXIT INT TERM
 fi
 
-echo "Starting nodes (N=$NODES, GRID=$GRID, EGESS_LOG=1)..."
-EGESS_LOG=1 ./start_nodes.sh "$NODES"
+echo "Starting nodes (N=$NODES, BASE_PORT=$BASE_PORT, GRID=$GRID, EGESS_LOG=1)..."
+EGESS_LOG=1 ./start_nodes.sh --base-port "$BASE_PORT" "$NODES"
 
-RUN_DIR="$(ls -1dt runs/* | head -n 1)"
+RUN_DIR="$(ls -1dt runs/*_p"${BASE_PORT}" | head -n 1)"
 echo "Run dir: $RUN_DIR"
-echo "Log tail tip: tail -f $RUN_DIR/node_9000.log"
+echo "Log tail tip: tail -f $RUN_DIR/node_${BASE_PORT}.log"
 
 if [[ "$RUN_VISUALIZER" -eq 0 ]]; then
   echo "Visualizer disabled (--no-visualizer). Nodes are running."
-  echo "Stop with: ./stopnodes"
+  echo "Stop with: ./stopnodes --base-port $BASE_PORT"
   exit 0
 fi
 
 echo "Launching visualizer (auto-demo=$AUTO_DEMO, period=${AUTO_PERIOD}s)..."
 ./.venv/bin/python visualize_mapping.py \
-  --base-port 9000 \
+  --base-port "$BASE_PORT" \
   --n "$NODES" \
   --grid "$GRID" \
   --auto-demo "$AUTO_DEMO" \

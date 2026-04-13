@@ -18,8 +18,22 @@ import json
 import os
 import time
 import requests
+from requests.adapters import HTTPAdapter
 
 RECENT_MSG_MAX = 60
+_HTTP_SESSION = None
+
+
+def _http_session():
+    global _HTTP_SESSION
+    if _HTTP_SESSION is None:
+        session = requests.Session()
+        session.trust_env = False
+        adapter = HTTPAdapter(pool_connections=128, pool_maxsize=128, max_retries=0, pool_block=False)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        _HTTP_SESSION = session
+    return _HTTP_SESSION
 
 
 def _demo_mode() -> bool:
@@ -159,54 +173,60 @@ def send_msg(config_json, node_state, state_lock, this_port, msg, target_port):
 
     try:
         host_url = "http://" + config_json["base_host"]
-        resp = requests.post("{}:{}/".format(host_url, target_port), json=msg, timeout=0.75)
+        resp = _http_session().post(
+            "{}:{}/".format(host_url, target_port),
+            json=msg,
+            timeout=(0.75, 0.75),
+        )
+        try:
+            if resp.status_code == 200:
+                resp_json = None
+                try:
+                    resp_json = resp.json()
+                except Exception:
+                    resp_json = {
+                        "op": "receipt",
+                        "data": {
+                            "success": False,
+                            "message": "invalid_json_response"
+                        },
+                        "metadata": {}
+                    }
 
-        if resp.status_code == 200:
-            resp_json = None
-            try:
-                resp_json = resp.json()
-            except Exception:
-                resp_json = {
+                if _log_enabled():
+                    print(
+                        "send_msg: SENT ({} -> {}): {}; RESPONSE: {}\n".format(
+                            this_port, target_port, msg, resp_json
+                        )
+                    )
+                state_lock.acquire()
+                try:
+                    counters = _ensure_msg_counters(node_state)
+                    counters["tx_ok"] = int(counters.get("tx_ok", 0)) + 1
+                    _append_recent_msg(node_state, "tx_ok:{} -> {}".format(op, target_port))
+                finally:
+                    state_lock.release()
+                return resp_json
+            else:
+                if _log_enabled():
+                    print("ERROR: send_msg: return code is not 200.\n")
+                state_lock.acquire()
+                try:
+                    counters = _ensure_msg_counters(node_state)
+                    counters["tx_fail"] = int(counters.get("tx_fail", 0)) + 1
+                    _append_recent_msg(node_state, "tx_fail:{} -> {} status={}".format(op, target_port, resp.status_code))
+                finally:
+                    state_lock.release()
+                return {
                     "op": "receipt",
                     "data": {
                         "success": False,
-                        "message": "invalid_json_response"
+                        "message": "http_status_{}".format(resp.status_code)
                     },
                     "metadata": {}
                 }
-
-            if _log_enabled():
-                print(
-                    "send_msg: SENT ({} -> {}): {}; RESPONSE: {}\n".format(
-                        this_port, target_port, msg, resp_json
-                    )
-                )
-            state_lock.acquire()
-            try:
-                counters = _ensure_msg_counters(node_state)
-                counters["tx_ok"] = int(counters.get("tx_ok", 0)) + 1
-                _append_recent_msg(node_state, "tx_ok:{} -> {}".format(op, target_port))
-            finally:
-                state_lock.release()
-            return resp_json
-        else:
-            if _log_enabled():
-                print("ERROR: send_msg: return code is not 200.\n")
-            state_lock.acquire()
-            try:
-                counters = _ensure_msg_counters(node_state)
-                counters["tx_fail"] = int(counters.get("tx_fail", 0)) + 1
-                _append_recent_msg(node_state, "tx_fail:{} -> {} status={}".format(op, target_port, resp.status_code))
-            finally:
-                state_lock.release()
-            return {
-                "op": "receipt",
-                "data": {
-                    "success": False,
-                    "message": "http_status_{}".format(resp.status_code)
-                },
-                "metadata": {}
-            }
+        finally:
+            resp.close()
 
     except requests.exceptions.ConnectionError:
         if _log_enabled():
@@ -243,6 +263,24 @@ def send_msg(config_json, node_state, state_lock, this_port, msg, target_port):
             "data": {
                 "success": False,
                 "message": "timeout"
+            },
+                "metadata": {}
+            }
+    except requests.exceptions.RequestException:
+        if _log_enabled():
+            print("ERROR: send_msg: HTTP request error.\n")
+        state_lock.acquire()
+        try:
+            counters = _ensure_msg_counters(node_state)
+            counters["tx_fail"] = int(counters.get("tx_fail", 0)) + 1
+            _append_recent_msg(node_state, "tx_request_error:{} -> {}".format(op, target_port))
+        finally:
+            state_lock.release()
+        return {
+            "op": "receipt",
+            "data": {
+                "success": False,
+                "message": "request_error"
             },
             "metadata": {}
         }

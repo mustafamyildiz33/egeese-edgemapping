@@ -15,6 +15,9 @@ runs/
 paper_reports/
 campaign_reports/
 comparison_reports/
+lab_comparison_reports/
+merged_paper_reports/
+statistics_reports/
 external/
 *.log
 .mplcache/

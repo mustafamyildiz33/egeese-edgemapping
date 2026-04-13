@@ -6,7 +6,15 @@ import random
 import egess_api
 
 
-NEIGHBOR_SCOPED_TYPES = ("front_alert", "stall_notice", "recovery_notice", "alert", "heartbeat")
+NEIGHBOR_SCOPED_TYPES = (
+    "front_alert",
+    "stall_notice",
+    "recovery_notice",
+    "alert_state",
+    "confirmation_notice",
+    "alert",
+    "heartbeat",
+)
 
 
 def push_protocol(config_json, node_state, state_lock, this_port, number_of_nodes, push_queue, msg):

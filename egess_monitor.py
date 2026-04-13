@@ -10,17 +10,26 @@ Usage:
   python3 egess_monitor.py --compact                    # only show non-NORMAL nodes
   python3 egess_monitor.py --demo spread --compact      # corner spread demo
   python3 egess_monitor.py --demo tornado --compact     # center tornado demo
+  python3 egess_monitor.py --demo tornado_sweep --n 49  # teammate-style 7x7 tornado sweep
 """
 
 import argparse
 import json
 import math
 import os
+import random
 import time
 import urllib.request
 
 
 SQRT3 = math.sqrt(3.0)
+
+
+def auto_grid(n):
+    root = int(math.isqrt(int(n)))
+    if root > 0 and root * root == int(n):
+        return int(root)
+    return int(math.ceil(math.sqrt(float(n))))
 
 
 def post_json(port, payload, timeout=1.0):
@@ -155,9 +164,7 @@ def hex_xy(r, cidx):
 
 
 def make_nodes(base, n):
-    g = int(round(math.sqrt(float(n))))
-    if g * g != n:
-        raise ValueError("--demo currently requires a square node count like 16, 36, or 64")
+    g = auto_grid(n)
     nodes = []
     for i in range(n):
         r = i // g
@@ -173,6 +180,15 @@ def make_nodes(base, n):
             }
         )
     return nodes, g
+
+
+def rc_to_port(base, row, col, grid, n):
+    if row < 0 or col < 0 or row >= grid or col >= grid:
+        return None
+    idx = row * grid + col
+    if idx < 0 or idx >= n:
+        return None
+    return base + idx
 
 
 def layers_from(start_port, nodes):
@@ -210,7 +226,9 @@ def corner_script(base, n):
         )
     steps.extend(
         [
-            {"a": [], "k": [], "r": [], "lbl": "No new losses — containment building"},
+            {"a": [], "k": [], "r": [], "lbl": "No new losses — stall detection begins"},
+            {"a": [], "k": [], "r": [], "lbl": "Stall persists — no new damage"},
+            {"a": [], "k": [], "r": [], "lbl": "Stall confirmed — slope flat or declining"},
             {"a": [], "k": [], "r": [], "lbl": "Front arrested — CONTAINED"},
         ]
     )
@@ -241,7 +259,9 @@ def tornado_script(base, n):
             "lbl": "Center destroyed, ring 1 hit",
         },
         {"a": [], "k": layers[1] if len(layers) > 1 else [], "r": [], "lbl": "Ring 1 destroyed"},
-        {"a": [], "k": [], "r": [], "lbl": "Destruction stops — containment building"},
+        {"a": [], "k": [], "r": [], "lbl": "Destruction stops — stall detection"},
+        {"a": [], "k": [], "r": [], "lbl": "Stall persists — no new damage"},
+        {"a": [], "k": [], "r": [], "lbl": "Slope flat — containment confirmed"},
         {"a": [], "k": [], "r": [], "lbl": "Front arrested — CONTAINED"},
         {"a": [], "k": [], "r": layers[0] if len(layers) > 0 else [], "lbl": "Center recovering"},
         {"a": [], "k": [], "r": layers[1] if len(layers) > 1 else [], "lbl": "Ring 1 recovering"},
@@ -249,11 +269,68 @@ def tornado_script(base, n):
     ]
 
 
-def build_demo_script(name, base, n):
+def tornado_sweep_script(base, n, seed=None, width=2):
+    grid = auto_grid(n)
+    width = max(1, min(int(width), int(grid)))
+    seed_value = int(time.time()) // 60 if seed is None else int(seed)
+    rng = random.Random(seed_value)
+    direction = rng.randint(0, 3)
+
+    steps = [{
+        "a": [],
+        "k": [],
+        "r": [],
+        "lbl": "Baseline — teammate-style tornado sweep (seed {})".format(seed_value),
+    }]
+
+    if direction in (0, 1):
+        start_row = rng.randint(0, grid - width)
+        band_rows = list(range(start_row, start_row + width))
+        dir_label = "L→R" if direction == 0 else "R→L"
+        for sweep_idx in range(grid):
+            col = sweep_idx if direction == 0 else (grid - 1 - sweep_idx)
+            kill_ports = []
+            for row in band_rows:
+                port = rc_to_port(base, row, col, grid, n)
+                if port is not None:
+                    kill_ports.append(port)
+            if kill_ports:
+                steps.append({
+                    "a": [],
+                    "k": sorted(kill_ports),
+                    "r": [],
+                    "lbl": "Tornado sweep {} rows {}-{} col {}".format(dir_label, start_row, start_row + width - 1, col),
+                })
+    else:
+        start_col = rng.randint(0, grid - width)
+        band_cols = list(range(start_col, start_col + width))
+        dir_label = "T→B" if direction == 2 else "B→T"
+        for sweep_idx in range(grid):
+            row = sweep_idx if direction == 2 else (grid - 1 - sweep_idx)
+            kill_ports = []
+            for col in band_cols:
+                port = rc_to_port(base, row, col, grid, n)
+                if port is not None:
+                    kill_ports.append(port)
+            if kill_ports:
+                steps.append({
+                    "a": [],
+                    "k": sorted(kill_ports),
+                    "r": [],
+                    "lbl": "Tornado sweep {} cols {}-{} row {}".format(dir_label, start_col, start_col + width - 1, row),
+                })
+
+    steps.append({"a": [], "k": [], "r": [], "lbl": "Tornado exited grid — destruction path complete"})
+    return steps
+
+
+def build_demo_script(name, base, n, tornado_seed=None, tornado_width=2):
     if name == "spread":
         return corner_script(base, n)
     if name == "tornado":
         return tornado_script(base, n)
+    if name == "tornado_sweep":
+        return tornado_sweep_script(base, n, seed=tornado_seed, width=tornado_width)
     raise ValueError("unknown demo: {}".format(name))
 
 
@@ -269,23 +346,24 @@ def apply_demo_step(step, all_ports, prev_alerts):
         return set(), actions
 
     for port in step.get("k", []) or []:
+        inject_state(port, "NORMAL", timeout=0.5)
         inject_fault(port, "crash_sim", True, timeout=0.5)
         actions.append("kill {}".format(port))
 
     for port in step.get("a", []) or []:
-        inject_fault(port, "reset", True, timeout=0.5)
+        inject_fault(port, "crash_sim", False, timeout=0.5)
         inject_state(port, "ALERT", timeout=0.5)
         actions.append("alert {}".format(port))
 
     for port in step.get("r", []) or []:
-        inject_fault(port, "reset", True, timeout=0.5)
+        inject_fault(port, "crash_sim", False, timeout=0.5)
         inject_state(port, "RECOVERING", timeout=0.5)
         actions.append("recover {}".format(port))
 
     return set(step.get("a", []) or []), actions
 
 
-def run(base, n, refresh, compact, demo=None, step_interval=6.0):
+def run(base, n, refresh, compact, demo=None, step_interval=6.0, tornado_seed=None, tornado_width=2):
     start = time.time()
     ports = [base + i for i in range(n)]
 
@@ -298,7 +376,7 @@ def run(base, n, refresh, compact, demo=None, step_interval=6.0):
     demo_done = False
 
     if demo:
-        demo_steps = build_demo_script(demo, base, n)
+        demo_steps = build_demo_script(demo, base, n, tornado_seed=tornado_seed, tornado_width=tornado_width)
         reset_ports(ports, timeout=0.5)
         demo_idx = 0
         demo_label = demo_steps[0].get("lbl", "Baseline")
@@ -309,8 +387,13 @@ def run(base, n, refresh, compact, demo=None, step_interval=6.0):
     banner = "  {} nodes on ports {}-{} | refresh {:.1f}s | Ctrl+C to stop".format(
         n, base, base + n - 1, refresh
     )
+    banner += " | L1=2-bit alert L2=confirmation"
     if demo:
         banner += " | demo={} step {:.0f}s".format(demo, step_interval)
+        if demo == "tornado_sweep":
+            banner += " width={}".format(int(tornado_width))
+            if tornado_seed is not None:
+                banner += " seed={}".format(int(tornado_seed))
     print(c(banner + "\n", "90"))
     time.sleep(0.4)
 
@@ -335,7 +418,7 @@ def run(base, n, refresh, compact, demo=None, step_interval=6.0):
                 states[port] = st
 
         elapsed = time.time() - start
-        W = 94
+        W = 106
 
         lines = [""]
         lines.append(c("┌" + "─" * W + "┐", "37;1"))
@@ -369,6 +452,8 @@ def run(base, n, refresh, compact, demo=None, step_interval=6.0):
                 + "┬"
                 + "─" * 12
                 + "┬"
+                + "─" * 9
+                + "┬"
                 + "─" * 6
                 + "┬"
                 + "─" * 8
@@ -377,11 +462,9 @@ def run(base, n, refresh, compact, demo=None, step_interval=6.0):
                 + "┬"
                 + "─" * 8
                 + "┬"
-                + "─" * 8
+                + "─" * 16
                 + "┬"
-                + "─" * 8
-                + "┬"
-                + "─" * 26
+                + "─" * 20
                 + "┤",
                 "37;1",
             )
@@ -393,6 +476,8 @@ def run(base, n, refresh, compact, demo=None, step_interval=6.0):
             + c("│", "37;1")
             + " State      "
             + c("│", "37;1")
+            + " Alert2b "
+            + c("│", "37;1")
             + " T    "
             + c("│", "37;1")
             + " Slope  "
@@ -401,11 +486,9 @@ def run(base, n, refresh, compact, demo=None, step_interval=6.0):
             + c("│", "37;1")
             + " Impact "
             + c("│", "37;1")
-            + " PullRx "
+            + " Layer2 Confirm "
             + c("│", "37;1")
-            + " PushRx "
-            + c("│", "37;1")
-            + " Missing                  "
+            + " Missing              "
             + c("│", "37;1")
         )
         lines.append(hdr)
@@ -416,6 +499,8 @@ def run(base, n, refresh, compact, demo=None, step_interval=6.0):
                 + "┼"
                 + "─" * 12
                 + "┼"
+                + "─" * 9
+                + "┼"
                 + "─" * 6
                 + "┼"
                 + "─" * 8
@@ -424,11 +509,9 @@ def run(base, n, refresh, compact, demo=None, step_interval=6.0):
                 + "┼"
                 + "─" * 8
                 + "┼"
-                + "─" * 8
+                + "─" * 16
                 + "┼"
-                + "─" * 8
-                + "┼"
-                + "─" * 26
+                + "─" * 20
                 + "┤",
                 "37;1",
             )
@@ -454,6 +537,8 @@ def run(base, n, refresh, compact, demo=None, step_interval=6.0):
                         + c("│", "37;1")
                         + c("OFFLINE".center(12), "90")
                         + c("│", "37;1")
+                        + c("—".center(9), "90")
+                        + c("│", "37;1")
                         + c("—".center(6), "90")
                         + c("│", "37;1")
                         + c("—".center(8), "90")
@@ -462,11 +547,9 @@ def run(base, n, refresh, compact, demo=None, step_interval=6.0):
                         + c("│", "37;1")
                         + c("—".center(8), "90")
                         + c("│", "37;1")
-                        + c("—".center(8), "90")
+                        + c("—".center(16), "90")
                         + c("│", "37;1")
-                        + c("—".center(8), "90")
-                        + c("│", "37;1")
-                        + c("(unreachable)".ljust(26), "90")
+                        + c("(unreachable)".ljust(20), "90")
                         + c("│", "37;1")
                     )
                 continue
@@ -496,6 +579,34 @@ def run(base, n, refresh, compact, demo=None, step_interval=6.0):
             if not miss_str:
                 miss_str = "—"
 
+            layer1 = st.get("layer1_alert", {})
+            if not isinstance(layer1, dict):
+                layer1 = {}
+            l1_bits = str(layer1.get("alert_bits", "00"))
+            l1_level = str(layer1.get("alert_level", "NORMAL")).upper()
+            l1_cell = "{}/{}".format(l1_bits, l1_level[:4])
+
+            layer2 = st.get("layer2_confirmation", {})
+            if not isinstance(layer2, dict):
+                layer2 = {}
+            l2_phase = str(layer2.get("phase", "CLEAR")).upper()
+            l2_dir = str(layer2.get("direction_label", ""))
+            l2_eta = round(float(layer2.get("eta_cycles", 99.0)), 1)
+            if l2_phase == "CLEAR":
+                l2_cell = "clear"
+            else:
+                short_phase = {
+                    "APPROACHING": "APP",
+                    "IMPACT": "IMP",
+                    "CONTAINED": "CON",
+                    "RECOVERING": "REC",
+                    "MONITORING": "MON",
+                }.get(l2_phase, l2_phase[:3])
+                if l2_eta < 90.0:
+                    l2_cell = "{} {}/{}c".format(short_phase, l2_dir or "-", str(l2_eta).rstrip("0").rstrip("."))
+                else:
+                    l2_cell = "{} {}".format(short_phase, l2_dir or "-")
+
             sc = STATE_COLOR.get(pstate, "0")
             is_active = t_score > 0 or pstate != "NORMAL"
 
@@ -510,6 +621,8 @@ def run(base, n, refresh, compact, demo=None, step_interval=6.0):
                     + " "
                     + c(pstate.ljust(11), sc)
                     + c("│", "37;1")
+                    + c(l1_cell.center(9), sc if l1_bits != "00" else "90")
+                    + c("│", "37;1")
                     + c("{:5.1f}".format(t_score), sc)
                     + " "
                     + c("│", "37;1")
@@ -523,12 +636,10 @@ def run(base, n, refresh, compact, demo=None, step_interval=6.0):
                     + c("{:6.1f}".format(ims), "31")
                     + "  "
                     + c("│", "37;1")
-                    + str(pr).center(8)
-                    + c("│", "37;1")
-                    + str(psr).center(8)
+                    + c(l2_cell.ljust(16), "35" if l2_phase in ("CONTAINED", "RECOVERING") else "33" if l2_phase == "APPROACHING" else "31" if l2_phase == "IMPACT" else "90")
                     + c("│", "37;1")
                     + " "
-                    + miss_str.ljust(25)
+                    + miss_str.ljust(19)
                     + c("│", "37;1")
                 )
             else:
@@ -537,6 +648,8 @@ def run(base, n, refresh, compact, demo=None, step_interval=6.0):
                     + c(str(port).center(6), "90")
                     + c("│", "37;1")
                     + c(" NORMAL".ljust(12), "90")
+                    + c("│", "37;1")
+                    + c("00/NORM".center(9), "90")
                     + c("│", "37;1")
                     + c("  0.0", "90")
                     + " "
@@ -550,11 +663,9 @@ def run(base, n, refresh, compact, demo=None, step_interval=6.0):
                     + c("   0.0", "90")
                     + "  "
                     + c("│", "37;1")
-                    + c(str(pr).center(8), "90")
+                    + c(" clear".ljust(16), "90")
                     + c("│", "37;1")
-                    + c(str(psr).center(8), "90")
-                    + c("│", "37;1")
-                    + c(" —".ljust(26), "90")
+                    + c(" —".ljust(20), "90")
                     + c("│", "37;1")
                 )
 
@@ -565,6 +676,8 @@ def run(base, n, refresh, compact, demo=None, step_interval=6.0):
                 + "┴"
                 + "─" * 12
                 + "┴"
+                + "─" * 9
+                + "┴"
                 + "─" * 6
                 + "┴"
                 + "─" * 8
@@ -573,11 +686,9 @@ def run(base, n, refresh, compact, demo=None, step_interval=6.0):
                 + "┴"
                 + "─" * 8
                 + "┴"
-                + "─" * 8
+                + "─" * 16
                 + "┴"
-                + "─" * 8
-                + "┴"
-                + "─" * 26
+                + "─" * 20
                 + "┤",
                 "37;1",
             )
@@ -630,6 +741,7 @@ def run(base, n, refresh, compact, demo=None, step_interval=6.0):
 
         score_lines = []
         message_lines = []
+        layer_lines = []
         active_ports = []
         for port in ports:
             st = states.get(port)
@@ -649,8 +761,21 @@ def run(base, n, refresh, compact, demo=None, step_interval=6.0):
             arrest_score = float(st.get("arrest_score", 0))
             coherence_score = int(st.get("coherence_score", 0))
             no_progress = int(st.get("no_progress_cycles", 0))
+            front_components = st.get("front_components", {})
             impact_components = st.get("impact_components", {})
             arrest_components = st.get("arrest_components", {})
+            layer1 = st.get("layer1_alert", {})
+            if not isinstance(layer1, dict):
+                layer1 = {}
+            layer2 = st.get("layer2_confirmation", {})
+            if not isinstance(layer2, dict):
+                layer2 = {}
+            last_layer1_rx = st.get("last_layer1_rx", {})
+            if not isinstance(last_layer1_rx, dict):
+                last_layer1_rx = {}
+            last_layer2_rx = st.get("last_layer2_rx", {})
+            if not isinstance(last_layer2_rx, dict):
+                last_layer2_rx = {}
 
             detail = "{} {:10} T={} | front={} impact={} arrest={} coh={}/3 noProg={}".format(
                 port,
@@ -668,6 +793,23 @@ def run(base, n, refresh, compact, demo=None, step_interval=6.0):
                 detail += " | persistMiss={}".format(_fmt_list(persistent_missing))
             if recovered_neighbors:
                 detail += " | recovered={}".format(_fmt_list(recovered_neighbors))
+
+            front_new = float(front_components.get("dominant_new_missing", 0.0))
+            front_persist = float(front_components.get("dominant_persistent_missing", 0.0))
+            front_disagree = int(front_components.get("dominant_disagreement", 0))
+            front_corr = int(front_components.get("dominant_corroboration", 0))
+            front_mom = int(front_components.get("dominant_momentum", 0))
+            if front_new > 0 or front_persist > 0 or front_disagree or front_corr or front_mom:
+                detail += " | front:{}new+{}persist+{}dg+{}corr+{}mom".format(
+                    round(front_new, 1),
+                    round(front_persist, 1),
+                    front_disagree,
+                    front_corr,
+                    front_mom,
+                )
+            front_confirm = float(front_components.get("dominant_confirmation", 0.0))
+            if front_confirm > 0.0:
+                detail += "+{}conf".format(round(front_confirm, 1))
 
             adj_new = int(impact_components.get("adjacent_new_missing", 0))
             adj_persist = int(impact_components.get("adjacent_persistent_missing", 0))
@@ -687,12 +829,30 @@ def run(base, n, refresh, compact, demo=None, step_interval=6.0):
 
             score_lines.append(detail)
 
+            layer_detail = "{} layers | L1 {} {} Δ{} cyc{} | L2 {} {} dist={} speed={} eta={}".format(
+                port,
+                str(layer1.get("alert_bits", "00")),
+                str(layer1.get("alert_level", "NORMAL")).upper(),
+                int(layer1.get("delta_bits", 0)),
+                int(layer1.get("cycle", 0)),
+                str(layer2.get("phase", "CLEAR")).upper(),
+                str(layer2.get("direction_label", "")) or "-",
+                round(float(layer2.get("distance_hops", 99.0)), 1) if float(layer2.get("distance_hops", 99.0)) < 90.0 else "?",
+                round(float(layer2.get("speed_hops_per_cycle", 0.0)), 1),
+                round(float(layer2.get("eta_cycles", 99.0)), 1) if float(layer2.get("eta_cycles", 99.0)) < 90.0 else "?",
+            )
+            if last_layer1_rx:
+                layer_detail += " | rxL1={}".format(str(last_layer1_rx.get("summary", "")))
+            if last_layer2_rx:
+                layer_detail += " | rxL2={}".format(str(last_layer2_rx.get("summary", "")))
+            layer_lines.append(layer_detail)
+
             recent_msgs = st.get("recent_msgs", [])
             if isinstance(recent_msgs, list) and recent_msgs:
                 for msg in recent_msgs[-2:]:
                     message_lines.append("{} {:4} {}".format(port, pstate[:4], str(msg)))
 
-        if score_lines or message_lines:
+        if score_lines or layer_lines or message_lines:
             lines.append(c("├" + "─" * W + "┤", "37;1"))
             lines.append(
                 c("│", "37;1")
@@ -701,6 +861,15 @@ def run(base, n, refresh, compact, demo=None, step_interval=6.0):
             )
             for detail in score_lines[:10]:
                 lines.append(c("│", "37;1") + _fit_plain("  " + detail, W) + c("│", "37;1"))
+
+            if layer_lines:
+                lines.append(
+                    c("│", "37;1")
+                    + c(_fit_plain("  Two-Layer Messages:", W), "36")
+                    + c("│", "37;1")
+                )
+                for detail in layer_lines[:10]:
+                    lines.append(c("│", "37;1") + _fit_plain("  " + detail, W) + c("│", "37;1"))
 
             if message_lines:
                 lines.append(
@@ -738,13 +907,24 @@ def main():
     parser.add_argument("--n", type=int, default=64)
     parser.add_argument("--refresh", type=float, default=2.0)
     parser.add_argument("--compact", action="store_true", help="Only show non-NORMAL nodes")
-    parser.add_argument("--demo", choices=("spread", "tornado"), help="Run a built-in demo against real nodes")
+    parser.add_argument("--demo", choices=("spread", "tornado", "tornado_sweep"), help="Run a built-in demo against real nodes")
     parser.add_argument("--step-interval", type=float, default=6.0, help="Seconds between demo injections")
+    parser.add_argument("--tornado-seed", type=int, help="Fixed seed for teammate-style tornado sweep")
+    parser.add_argument("--tornado-width", type=int, default=2, help="Band width for teammate-style tornado sweep")
     args = parser.parse_args()
 
     ports = [args.base + i for i in range(args.n)]
     try:
-        run(args.base, args.n, args.refresh, args.compact, demo=args.demo, step_interval=args.step_interval)
+        run(
+            args.base,
+            args.n,
+            args.refresh,
+            args.compact,
+            demo=args.demo,
+            step_interval=args.step_interval,
+            tornado_seed=args.tornado_seed,
+            tornado_width=args.tornado_width,
+        )
     except KeyboardInterrupt:
         if args.demo:
             reset_ports(ports, timeout=0.5)
