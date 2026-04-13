@@ -16,7 +16,7 @@ This implementation currently supports `EGESS` directly. The comparison protocol
 
 The React demo now also includes an in-app `Paper Evaluation Runbook` panel so the phase structure, commands, outputs, and push checklist are visible in the frontend demo and not only in terminal-oriented documentation.
 
-All evaluation and testing runs are designed to happen on the same computer. The runner starts local nodes, executes the scenario locally, collects the reports locally, and writes all evidence into the local workspace.
+All evaluation and testing runs are designed to happen on one host at a time. For a shared lab server, simultaneous users must choose different base ports such as `9000`, `9100`, `9200`, and stop only their own base port.
 
 ## What Was Added
 

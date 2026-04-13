@@ -26,12 +26,17 @@ Stop with:
 Useful options:
 ```
 ./startnodes --nodes 16 --grid 4 --auto-demo firebomb --auto-period 10
+./startnodes --base-port 9100 --nodes 16 --no-visualizer
 ./startnodes --no-visualizer
 ```
 
 ### Step I: Start the nodes
 ```
 EGESS_LOG=1 ./start_nodes.sh 16
+```
+On a shared server, give each simultaneous run a different base port:
+```
+./start_nodes.sh --base-port 9100 16
 ```
 
 ### Step II: Observe the logs in real time
@@ -88,6 +93,10 @@ Outputs are written into the latest run directory:
 Stop the network and kill all nodes using this command:
 ```
 ./stop_nodes.sh
+```
+On a shared server, stop only your assigned base port:
+```
+./stop_nodes.sh --base-port 9100
 ```
 
 ### Step V: Observe the logs and the data

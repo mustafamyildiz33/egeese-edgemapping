@@ -7,6 +7,7 @@ reports for the whole suite and for each individual run.
 """
 
 import argparse
+import concurrent.futures
 import csv
 import json
 import math
@@ -16,17 +17,48 @@ import re
 import statistics
 import subprocess
 import sys
+import threading
 import time
 from collections import deque
 from html import escape
 from pathlib import Path
-from urllib import request
+
+import requests
+from requests.adapters import HTTPAdapter
 
 
 ROOT_DIR = Path(__file__).resolve().parent
 RUNS_DIR = ROOT_DIR / "runs"
 REPORTS_DIR = ROOT_DIR / "paper_reports"
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+FULL_EVIDENCE = str(os.environ.get("EGESS_FULL_EVIDENCE", "0")).strip().lower() in ("1", "true", "yes", "on")
+PRETTY_JSON = str(os.environ.get("EGESS_PRETTY_JSON", "0")).strip().lower() in ("1", "true", "yes", "on")
+HTML_REPLAY = str(os.environ.get("EGESS_HTML_REPLAY", "0")).strip().lower() in ("1", "true", "yes", "on")
+WRITE_RUN_HTML = str(os.environ.get("EGESS_WRITE_RUN_HTML", "1")).strip().lower() in ("1", "true", "yes", "on")
+WRITE_LIVE_HTML = str(os.environ.get("EGESS_WRITE_LIVE_HTML", "1")).strip().lower() in ("1", "true", "yes", "on")
+WRITE_RUN_FIGURES = str(os.environ.get("EGESS_WRITE_RUN_FIGURES", "0")).strip().lower() in ("1", "true", "yes", "on")
+WRITE_SUITE_FIGURES = str(os.environ.get("EGESS_WRITE_SUITE_FIGURES", "1")).strip().lower() in ("1", "true", "yes", "on")
+WRITE_PNG_FIGURES = str(os.environ.get("EGESS_WRITE_PNG_FIGURES", "1")).strip().lower() in ("1", "true", "yes", "on")
+HTML_NODE_LOG_LINES = max(0, int(os.environ.get("EGESS_HTML_NODE_LOG_LINES", "0")))
+HTML_TABLE_ROW_LIMIT = max(0, int(os.environ.get("EGESS_HTML_TABLE_ROW_LIMIT", "200")))
+HISTORY_SCOPE = str(os.environ.get("EGESS_HISTORY_SCOPE", "watch")).strip().lower()
+KEEP_HISTORY_JSONL = str(os.environ.get("EGESS_KEEP_HISTORY_JSONL", "0")).strip().lower() in ("1", "true", "yes", "on")
+EVIDENCE_RECENT_MSG_LIMIT = max(0, int(os.environ.get("EGESS_EVIDENCE_RECENT_MSG_LIMIT", "4")))
+EVIDENCE_RECENT_ALERT_LIMIT = max(0, int(os.environ.get("EGESS_EVIDENCE_RECENT_ALERT_LIMIT", "4")))
+SAMPLE_WORKERS = max(1, int(os.environ.get("EGESS_SAMPLE_WORKERS", "16")))
+_HTTP_LOCAL = threading.local()
+
+
+def _http_session():
+    session = getattr(_HTTP_LOCAL, "session", None)
+    if session is None:
+        session = requests.Session()
+        session.trust_env = False
+        adapter = HTTPAdapter(pool_connections=128, pool_maxsize=128, max_retries=0, pool_block=False)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        _HTTP_LOCAL.session = session
+    return session
 
 
 SUMMARY_FIELDS = [
@@ -38,6 +70,7 @@ SUMMARY_FIELDS = [
     "duration_sec",
     "active_duration_sec",
     "nodes",
+    "base_port",
     "run_index",
     "seed",
     "run_dir",
@@ -324,11 +357,12 @@ COMPARISON_FIELDS = [
 FIELD_LABELS = {
     "active_duration_sec": "Active Time",
     "accepted_messages": "Accepted Msgs",
+    "base_port": "Base Port",
     "checkin_bytes": "Check-In Bytes",
-    "checkin_detection_speed": "Check-In Detection Speed",
+    "checkin_detection_speed": "Check-In Detection Latency",
     "checkin_failures": "Check-In Failures",
     "checkin_setup": "Check-In Setup",
-    "avg_detection_speed_sec": "Avg Detection Speed",
+    "avg_detection_speed_sec": "Avg Detection Latency",
     "avg_false_positive_nodes": "Avg False Positives",
     "avg_false_unavailable_refs": "Avg False Unavailable",
     "avg_push_rx_total": "Avg Push RX",
@@ -339,22 +373,26 @@ FIELD_LABELS = {
     "challenge": "Challenge",
     "comparison_note": "Note",
     "comparison_status": "Compare",
+    "bytes_winner": "Overhead Winner",
     "coherence_score": "Coherence",
     "crash_sim": "Crash Sim",
     "current_missing_count": "Missing",
     "detail": "Detail",
-    "detection_speed_sec": "Detection Speed",
+    "detection_latency_winner": "Detection Latency Winner",
+    "detection_speed_sec": "Detection Latency",
     "direction_label": "Direction",
     "distance_hops": "Distance",
     "duration_sec": "Duration",
     "egess_bytes": "EGESS Bytes",
-    "egess_detection_speed": "EGESS Detection Speed",
+    "egess_detection_speed": "EGESS Detection Latency",
     "egess_failures": "EGESS Failures",
     "egess_setup": "EGESS Setup",
     "eta_cycles": "ETA",
     "events_total": "Events",
     "false_positive_nodes": "False Positive Nodes",
+    "false_positive_winner": "False Positive Winner",
     "false_unavailable_refs": "False Unavailable Refs",
+    "false_unavailable_winner": "False Unavailable Winner",
     "far_watch_port": "Far Port",
     "fault_ops": "Fault Ops",
     "flap": "Flap",
@@ -392,8 +430,10 @@ FIELD_LABELS = {
     "sample_label": "Sample Label",
     "sample_sec": "Sample Time",
     "scenario_label": "Scenario",
+    "speed_winner": "Detection Latency Winner",
     "samples": "Samples",
     "settle_accuracy_pct": "Settle Accuracy",
+    "accuracy_winner": "Accuracy Winner",
     "suite_id": "Suite",
     "time_sec": "Time",
     "time_window": "Time Window",
@@ -536,15 +576,16 @@ def _neighbors_for_port(base_port, number_of_nodes, port):
 
 
 def _post_json(port, payload, timeout=1.0):
-    body = json.dumps(payload).encode("utf-8")
-    req = request.Request(
+    resp = _http_session().post(
         "http://127.0.0.1:{}/".format(int(port)),
-        data=body,
-        headers={"Content-Type": "application/json"},
-        method="POST",
+        json=payload,
+        timeout=(timeout, timeout),
     )
-    with request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    try:
+        resp.raise_for_status()
+        return resp.json()
+    finally:
+        resp.close()
 
 
 def _pull_state(port, origin="paper_eval", timeout=1.0):
@@ -556,7 +597,7 @@ def _pull_state(port, origin="paper_eval", timeout=1.0):
     return _post_json(port, payload, timeout=timeout)
 
 
-def _trigger_push(port, label, timeout=1.2):
+def _trigger_push(port, label, timeout=2.0):
     payload = {
         "op": "push",
         "data": {
@@ -573,7 +614,7 @@ def _trigger_push(port, label, timeout=1.2):
     return _post_json(port, payload, timeout=timeout)
 
 
-def _inject_fault(port, fault, enable=True, period_sec=4, timeout=1.2):
+def _inject_fault(port, fault, enable=True, period_sec=4, timeout=2.0):
     payload = {
         "op": "inject_fault",
         "data": {
@@ -586,13 +627,25 @@ def _inject_fault(port, fault, enable=True, period_sec=4, timeout=1.2):
     return _post_json(port, payload, timeout=timeout)
 
 
-def _inject_state(port, sensor_state, timeout=1.2):
+def _inject_state(port, sensor_state, timeout=2.0):
     payload = {
         "op": "inject_state",
         "data": {"sensor_state": str(sensor_state).strip().upper()},
         "metadata": {"origin": "paper_eval"},
     }
     return _post_json(port, payload, timeout=timeout)
+
+
+def _call_with_retries(fn, attempts=2, delay_sec=0.2):
+    last_exc = None
+    for attempt in range(max(1, int(attempts))):
+        try:
+            return fn()
+        except Exception as exc:
+            last_exc = exc
+            if attempt + 1 < max(1, int(attempts)):
+                time.sleep(float(delay_sec))
+    raise last_exc
 
 
 def _append_jsonl(path, row):
@@ -611,7 +664,10 @@ def _log_event(path, kind, data):
 
 def _write_json(path, payload):
     with open(path, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2)
+        if PRETTY_JSON:
+            json.dump(payload, handle, indent=2)
+        else:
+            json.dump(payload, handle, separators=(",", ":"))
 
 
 def _write_tsv(path, rows, fields):
@@ -627,6 +683,23 @@ def _write_tsv(path, rows, fields):
                     value = json.dumps(value, sort_keys=True)
                 values.append(str(value))
             handle.write("\t".join(values) + "\n")
+
+
+def _write_csv(path, rows, fields):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            out = {}
+            for field in fields:
+                value = row.get(field, "")
+                if isinstance(value, float):
+                    value = "{:.3f}".format(value)
+                elif isinstance(value, (dict, list)):
+                    value = json.dumps(value, sort_keys=True)
+                out[field] = value
+            writer.writerow(out)
 
 
 def _field_label(field):
@@ -802,6 +875,8 @@ def _badge_class(field, value):
     if field == "status":
         if lower_text == "ok":
             return "pill-good"
+        if lower_text in ("running", "planned"):
+            return "pill-warn"
         if lower_text in ("warn", "warning"):
             return "pill-warn"
         return "pill-bad"
@@ -925,9 +1000,14 @@ def _render_run_deep_dive_html(report_dir, summary_rows):
 </section>"""
 
     cards = []
+    linked_count = 0
     for row in sorted(summary_rows, key=lambda item: (int(item.get("nodes", 0)), int(item.get("run_index", 0)))):
         run_path = ROOT_DIR / str(row.get("run_dir", "")).strip() / "paper_summary.html"
-        href = os.path.relpath(run_path, start=report_dir)
+        action_html = '<span class="run-link-action">Suite Rows Only</span>'
+        if run_path.exists():
+            href = os.path.relpath(run_path, start=report_dir)
+            linked_count += 1
+            action_html = '<a class="run-link-action" href="{}">Open Node Spotlight</a>'.format(escape(href))
         status = _format_display_value("status", row.get("status", ""))
         badge_class = _badge_class("status", row.get("status", "")) or "pill-soft"
         cards.append(
@@ -941,10 +1021,10 @@ def _render_run_deep_dive_html(report_dir, summary_rows):
   </div>
   <div class="run-link-stats">
     <span>{active_time}</span>
-    <span>{traffic}</span>
+    <span>{overhead}</span>
     <span>{failures} TX fail</span>
   </div>
-  <a class="run-link-action" href="{href}">Open Node Spotlight</a>
+  {action_html}
 </article>""".format(
                 run_index=escape(_format_display_value("run_index", row.get("run_index", ""))),
                 nodes=escape(_format_display_value("nodes", row.get("nodes", ""))),
@@ -953,19 +1033,25 @@ def _render_run_deep_dive_html(report_dir, summary_rows):
                 badge_class=escape(badge_class),
                 status=escape(status),
                 active_time=escape(_format_display_value("active_duration_sec", row.get("active_duration_sec", ""))),
-                traffic=escape(_format_display_value("total_mb", row.get("total_mb", ""))),
+                overhead=escape(_format_display_value("total_mb", row.get("total_mb", ""))),
                 failures=escape(_format_display_value("tx_fail_total", row.get("tx_fail_total", ""))),
-                href=escape(href),
+                action_html=action_html,
             )
         )
+
+    note = "Open any run below to use Node Spotlight, inspect a specific port, and see that node's counters and history."
+    if linked_count == 0:
+        note = "Per-run HTML was disabled for lean collection, so use Paper Highlights, Watched Nodes, and the exported suite figures below."
+    elif linked_count < len(summary_rows):
+        note = "Some lean runs do not have per-run HTML. Paper Highlights and Watched Nodes summarize every run."
 
     return """<section class="panel">
 <div class="panel-head">
   <h2>Run Deep Dives</h2>
-  <p class="section-note">Open any run below to use Node Spotlight, inspect a specific port, and see that node's counters and history.</p>
+  <p class="section-note">{note}</p>
 </div>
 <div class="run-link-grid">{}</div>
-</section>""".format("".join(cards))
+</section>""".format("".join(cards), note=escape(note))
 
 
 def _html_page(title, subtitle, cards_html, sections_html, script_html=""):
@@ -1206,6 +1292,22 @@ def _html_page(title, subtitle, cards_html, sections_html, script_html=""):
       color: var(--muted);
       font-size: 0.9rem;
       line-height: 1.45;
+    }}
+    .progress-shell {{
+      height: 18px;
+      border-radius: 999px;
+      overflow: hidden;
+      background: #e8edf5;
+      border: 1px solid var(--line);
+      margin: 12px 0;
+    }}
+    .progress-shell span {{
+      display: block;
+      height: 100%;
+      min-width: 2px;
+      background: linear-gradient(90deg, var(--teal), var(--blue));
+      box-shadow: 0 8px 22px rgba(42, 111, 151, 0.25);
+      transition: width 0.35s ease;
     }}
     .chart-card {{
       background: linear-gradient(180deg, #ffffff, #f9fbff);
@@ -1594,6 +1696,150 @@ def _html_page(title, subtitle, cards_html, sections_html, script_html=""):
       box-shadow: inset 0 0 0 2px rgba(17, 138, 126, 0.42);
       background: rgba(17, 138, 126, 0.08) !important;
     }}
+    .replay-shell {{
+      display: grid;
+      grid-template-columns: minmax(320px, 1.4fr) minmax(260px, 1fr);
+      gap: 16px;
+      margin-top: 12px;
+    }}
+    .replay-card {{
+      background: linear-gradient(180deg, #ffffff, #f8fbff);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      padding: 16px;
+    }}
+    .replay-meta {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 12px;
+    }}
+    .replay-meta .badge {{
+      border-radius: 999px;
+      padding: 7px 10px;
+      background: rgba(36, 116, 229, 0.08);
+      color: var(--ink);
+      border: 1px solid rgba(36, 116, 229, 0.12);
+      font-weight: 700;
+    }}
+    .replay-controls {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      align-items: center;
+      margin-top: 12px;
+    }}
+    .replay-controls input[type="range"] {{
+      flex: 1 1 220px;
+      accent-color: #2474e5;
+    }}
+    .replay-button {{
+      border: 1px solid var(--line);
+      background: #ffffff;
+      color: var(--ink);
+      border-radius: 999px;
+      padding: 9px 14px;
+      font: inherit;
+      font-weight: 700;
+      cursor: pointer;
+    }}
+    .replay-button:hover {{
+      background: #f3f7ff;
+    }}
+    .replay-stage {{
+      margin-top: 12px;
+      padding: 12px 14px;
+      border-radius: 14px;
+      background: linear-gradient(135deg, rgba(255, 122, 89, 0.10), rgba(255, 206, 84, 0.12));
+      border: 1px solid rgba(255, 122, 89, 0.16);
+    }}
+    .replay-stage-title {{
+      font-weight: 800;
+      margin-bottom: 4px;
+    }}
+    .replay-stage-note {{
+      color: var(--muted);
+      font-size: 0.92rem;
+      line-height: 1.45;
+    }}
+    .replay-legend {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 10px;
+      margin-top: 12px;
+    }}
+    .legend-chip {{
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      border-radius: 999px;
+      background: #fff;
+      border: 1px solid var(--line);
+      padding: 6px 10px;
+      font-size: 0.88rem;
+      color: var(--muted);
+    }}
+    .legend-swatch {{
+      width: 12px;
+      height: 12px;
+      border-radius: 999px;
+      border: 1px solid rgba(15, 23, 42, 0.14);
+    }}
+    .replay-svg-wrap {{
+      margin-top: 14px;
+      border-radius: 18px;
+      border: 1px solid var(--line);
+      background: radial-gradient(circle at top, rgba(246, 250, 255, 0.96), #ffffff 65%);
+      padding: 12px;
+      min-height: 320px;
+    }}
+    .replay-svg {{
+      width: 100%;
+      height: auto;
+      display: block;
+    }}
+    .replay-node {{
+      cursor: pointer;
+      transition: transform 120ms ease, opacity 120ms ease;
+    }}
+    .replay-node:hover {{
+      transform: translateY(-1px);
+    }}
+    .replay-node.is-selected .replay-node-shape {{
+      stroke: #0f172a;
+      stroke-width: 3;
+    }}
+    .replay-node.is-watch .replay-node-shape {{
+      stroke-width: 3;
+    }}
+    .replay-node-shape {{
+      stroke: rgba(15, 23, 42, 0.16);
+      stroke-width: 1.4;
+    }}
+    .replay-node-label {{
+      font-size: 10px;
+      font-weight: 700;
+      fill: #0f172a;
+      pointer-events: none;
+    }}
+    .replay-empty {{
+      display: grid;
+      place-items: center;
+      min-height: 220px;
+      color: var(--muted);
+      font-weight: 700;
+    }}
+    .replay-detail-list {{
+      margin: 12px 0 0;
+      padding-left: 18px;
+      display: grid;
+      gap: 6px;
+      color: var(--muted);
+      line-height: 1.45;
+    }}
+    .replay-detail-list strong {{
+      color: var(--ink);
+    }}
     .scenario-tab-row {{
       display: flex;
       flex-wrap: wrap;
@@ -1665,6 +1911,7 @@ def _html_page(title, subtitle, cards_html, sections_html, script_html=""):
       .page {{ padding: 16px 14px 36px; }}
       .hero {{ padding: 18px 18px; border-radius: 18px; }}
       .hero h1 {{ font-size: 1.55rem; }}
+      .replay-shell {{ grid-template-columns: 1fr; }}
     }}
   </style>
 </head>
@@ -1719,6 +1966,15 @@ def _write_text(path, content):
         handle.write(content)
 
 
+def _remove_file_if_exists(path):
+    if path is None:
+        return
+    try:
+        Path(path).unlink()
+    except FileNotFoundError:
+        pass
+
+
 def _strip_ansi(text):
     return ANSI_ESCAPE_RE.sub("", str(text or ""))
 
@@ -1756,6 +2012,86 @@ def _load_jsonl(path):
     return rows
 
 
+def _event_tail_rows(events_path, max_rows=14):
+    rows = []
+    for line in _tail_text_lines(Path(events_path), max_lines=max_rows):
+        try:
+            payload = json.loads(line)
+        except Exception:
+            rows.append({"time": "", "kind": "raw", "label": line[:120], "port": "", "detail": ""})
+            continue
+        data = payload.get("data", {}) if isinstance(payload.get("data", {}), dict) else {}
+        detail = data.get("label") or data.get("name") or data.get("sensor_state") or data.get("fault") or data.get("error") or ""
+        rows.append(
+            {
+                "time": _format_display_value("active_duration_sec", data.get("at_sec", "")),
+                "kind": str(payload.get("kind", "")),
+                "label": str(detail),
+                "port": data.get("port", ""),
+                "detail": str(data.get("error", data.get("ok", ""))),
+            }
+        )
+    return rows
+
+
+def _latest_history_total(history_totals_path):
+    if history_totals_path is None or not Path(history_totals_path).exists():
+        return {}
+    rows = _load_jsonl(history_totals_path)
+    return rows[-1] if rows else {}
+
+
+def _write_live_run_html(run_dir, spec, run_index, seed, number_of_nodes, events_path, status, elapsed_sec, duration_sec, history_totals_path=None):
+    if not WRITE_LIVE_HTML:
+        return
+    run_dir = Path(run_dir)
+    status_text = str(status)
+    elapsed = max(0.0, _to_float(elapsed_sec, 0.0))
+    duration = max(1.0, _to_float(duration_sec, 1.0))
+    pct = min(100.0, max(0.0, 100.0 * elapsed / duration))
+    latest = _latest_history_total(history_totals_path)
+    cards = [
+        {"label": "Status", "value": status_text, "note": str(spec.get("phase_name", "")), "tone": "accent"},
+        {"label": "Scenario", "value": _scenario_label(spec.get("phase_id", ""), spec.get("challenge", "")), "note": str(spec.get("challenge", "")), "tone": "accent"},
+        {"label": "Progress", "value": "{}%".format(round(pct, 1)), "note": "{} / {} seconds".format(_format_display_value("active_duration_sec", elapsed), _format_display_value("duration_sec", duration)), "tone": "accent"},
+        {"label": "Nodes", "value": str(int(number_of_nodes)), "note": "run {} seed {}".format(int(run_index), int(seed)), "tone": "accent"},
+    ]
+    metric_rows = [
+        {"metric": "Pull RX", "value": latest.get("pull_rx", "")},
+        {"metric": "Push RX", "value": latest.get("push_rx", "")},
+        {"metric": "Pull TX", "value": latest.get("pull_tx", "")},
+        {"metric": "Push TX", "value": latest.get("push_tx", "")},
+        {"metric": "Accepted Msgs", "value": latest.get("accepted_messages", "")},
+        {"metric": "MB", "value": _format_display_value("total_mb", latest.get("total_mb", "")) if latest else ""},
+    ]
+    refresh = ""
+    if status_text.upper() not in ("DONE", "FAILED"):
+        refresh = "<script>setTimeout(function(){ window.location.reload(); }, 2000);</script>"
+    sections = [
+        """
+<section>
+  <h2>Live Run Progress</h2>
+  <p class="section-note">This page updates while the terminal batch is running. Keep it beside the event tail for the live view.</p>
+  <div class="progress-shell"><span style="width:{pct:.1f}%"></span></div>
+  <p class="micro-note">When the run finishes, open <code>paper_summary.html</code> for the final summary, watched-node charts, TSVs, and figures.</p>
+</section>
+""".format(pct=pct),
+        _render_table_html("Latest Sample Totals", metric_rows, ["metric", "value"], "These are sampled totals from the active run when history is available."),
+        _render_table_html("Recent Event Tail", _event_tail_rows(events_path), ["time", "kind", "label", "port", "detail"], "Same event stream as paper_events.jsonl, shown in the browser while the run continues."),
+        _render_links_html("Run Files", [("paper_events.jsonl", "Event Stream"), ("live_run.html", "Live Run Page"), ("paper_summary.html", "Final Run Dashboard")]),
+    ]
+    _write_text(
+        run_dir / "live_run.html",
+        _html_page(
+            "Live Paper Evaluation Run",
+            "{} | {} nodes | run {}".format(str(spec.get("phase_name", "")), int(number_of_nodes), int(run_index)),
+            _render_cards_html(cards),
+            "".join(sections),
+            script_html=refresh,
+        ),
+    )
+
+
 def _resolved_protocol_state_from_state(state):
     state = state if isinstance(state, dict) else {}
     protocol_state = str(state.get("protocol_state", "")).strip().upper()
@@ -1787,8 +2123,17 @@ def _is_normalish_label(text):
     return str(text or "").strip().upper() in ("", "NORMAL", "STABLE", "CLEAR")
 
 
+def _is_settled_phase_label(text):
+    return str(text or "").strip().upper() in ("", "NORMAL", "STABLE", "CLEAR", "MONITORING")
+
+
 def _false_unavailable_refs_from_state(state):
     state = state if isinstance(state, dict) else {}
+    for cached_key in ("false_unavailable_refs", "current_missing_count"):
+        if cached_key in state:
+            cached_value = _maybe_int(state.get(cached_key))
+            if cached_value is not None:
+                return max(0, int(cached_value))
     refs = set()
 
     current_missing = state.get("current_missing_neighbors", [])
@@ -1829,11 +2174,72 @@ def _false_positive_flag_from_state(state):
     phase = _resolved_phase_from_state(state)
     if not _is_normalish_label(protocol_state):
         return 1
-    if not _is_normalish_label(phase):
+    if not _is_settled_phase_label(phase):
         return 1
     if _false_unavailable_refs_from_state(state) > 0:
         return 1
     return 0
+
+
+def _bounded_json_list(value, limit, string_limit=500):
+    if not isinstance(value, list) or limit <= 0:
+        return []
+    out = []
+    for item in value[-int(limit) :]:
+        safe = item
+        if isinstance(item, str) and len(item) > string_limit:
+            safe = item[:string_limit] + "..."
+        elif not isinstance(item, (str, int, float, bool, dict, list, type(None))):
+            safe = str(item)
+        out.append(safe)
+    return out
+
+
+def _compact_node_state_for_evidence(state, false_unavailable_count):
+    state = state if isinstance(state, dict) else {}
+    if FULL_EVIDENCE:
+        return state
+    layer2 = state.get("layer2_confirmation", {}) if isinstance(state.get("layer2_confirmation"), dict) else {}
+    faults = state.get("faults", {}) if isinstance(state.get("faults"), dict) else {}
+    compact = {}
+    for key in (
+        "protocol_state",
+        "boundary_kind",
+        "accepted_messages",
+        "score",
+        "front_score",
+        "impact_score",
+        "arrest_score",
+        "coherence_score",
+        "pull_cycles",
+        "DESTROYED",
+        "SURVEYING",
+        "ALARMED",
+        "ON_FIRE",
+        "NORMAL",
+    ):
+        if key in state:
+            compact[key] = state.get(key)
+    compact["layer2_confirmation"] = {
+        key: layer2.get(key)
+        for key in ("direction_label", "phase", "distance_hops", "eta_cycles")
+        if key in layer2
+    }
+    compact["faults"] = {
+        "crash_sim": bool(faults.get("crash_sim", False)),
+        "lie_sensor": bool(faults.get("lie_sensor", False)),
+        "flap": bool(faults.get("flap", False)),
+    }
+    compact["false_unavailable_refs"] = int(false_unavailable_count)
+    compact["current_missing_count"] = int(false_unavailable_count)
+    compact["recent_msgs"] = _bounded_json_list(state.get("recent_msgs", []), EVIDENCE_RECENT_MSG_LIMIT)
+    compact["recent_alerts"] = _bounded_json_list(state.get("recent_alerts", []), EVIDENCE_RECENT_ALERT_LIMIT)
+    compact["current_missing_neighbors"] = _bounded_json_list(state.get("current_missing_neighbors", []), 20)
+    compact["persistent_missing_neighbors"] = _bounded_json_list(state.get("persistent_missing_neighbors", []), 20)
+    compact["new_missing_neighbors"] = _bounded_json_list(state.get("new_missing_neighbors", []), 20)
+    compact["incoming_events_count"] = len(state.get("incoming_events", [])) if isinstance(state.get("incoming_events"), list) else _to_int(state.get("incoming_events_count", 0), 0)
+    compact["known_nodes_count"] = len(state.get("known_nodes", [])) if isinstance(state.get("known_nodes"), list) else _to_int(state.get("known_nodes_count", 0), 0)
+    return compact
 
 
 def _history_row_has_hazard_signal(row):
@@ -2084,8 +2490,36 @@ def _all_node_rows(evidence):
     return out
 
 
-def _sample_nodes(base_port, number_of_nodes, sample_index, sample_sec):
+def _sample_node_row(port):
+    try:
+        res = _pull_state(port, origin="paper_history", timeout=0.75)
+        state = res.get("data", {}).get("node_state", {}) if isinstance(res, dict) else {}
+        counters = state.get("msg_counters", {}) if isinstance(state.get("msg_counters"), dict) else {}
+        return int(port), _node_row_from_state(port, True, state=state, counters=counters)
+    except Exception as exc:
+        return int(port), _node_row_from_state(port, False, state={}, counters={}, error=str(exc))
+
+
+def _parallel_port_results(ports, worker):
+    ordered_ports = [int(port) for port in ports]
+    if len(ordered_ports) <= 1:
+        return [(port, worker(port)) for port in ordered_ports]
+
+    results = {}
+    worker_count = min(len(ordered_ports), SAMPLE_WORKERS)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = {executor.submit(worker, port): int(port) for port in ordered_ports}
+        for future in concurrent.futures.as_completed(futures):
+            port = futures[future]
+            results[int(port)] = future.result()
+    return [(port, results[int(port)]) for port in ordered_ports]
+
+
+def _sample_nodes(base_port, number_of_nodes, sample_index, sample_sec, history_ports=None):
     rows = []
+    history_port_set = None
+    if history_ports is not None:
+        history_port_set = {int(port) for port in history_ports if _to_int(port, -1) >= 0}
     totals = {
         "sample_index": int(sample_index),
         "sample_sec": round(float(sample_sec), 3),
@@ -2102,15 +2536,23 @@ def _sample_nodes(base_port, number_of_nodes, sample_index, sample_sec):
         "total_mb": 0.0,
     }
 
-    for port in range(int(base_port), int(base_port) + int(number_of_nodes)):
-        try:
-            res = _pull_state(port, origin="paper_history", timeout=0.75)
-            state = res.get("data", {}).get("node_state", {}) if isinstance(res, dict) else {}
-            counters = state.get("msg_counters", {}) if isinstance(state.get("msg_counters"), dict) else {}
-            row = _node_row_from_state(port, True, state=state, counters=counters)
+    ports = list(range(int(base_port), int(base_port) + int(number_of_nodes)))
+    sampled = {}
+    worker_count = min(len(ports), SAMPLE_WORKERS)
+    if worker_count <= 1:
+        for port in ports:
+            sampled[int(port)] = _sample_node_row(port)[1]
+    else:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = [executor.submit(_sample_node_row, port) for port in ports]
+            for future in concurrent.futures.as_completed(futures):
+                port, row = future.result()
+                sampled[int(port)] = row
+
+    for port in ports:
+        row = sampled.get(int(port), _node_row_from_state(port, False, state={}, counters={}, error="sample_missing"))
+        if bool(row.get("reachable", False)):
             totals["reachable_nodes"] += 1
-        except Exception as exc:
-            row = _node_row_from_state(port, False, state={}, counters={}, error=str(exc))
 
         row.update(
             {
@@ -2119,7 +2561,8 @@ def _sample_nodes(base_port, number_of_nodes, sample_index, sample_sec):
                 "sample_label": "t+{:.1f}s".format(float(sample_sec)),
             }
         )
-        rows.append(row)
+        if history_port_set is None or int(port) in history_port_set:
+            rows.append(row)
         totals["accepted_messages_total"] += _to_int(row.get("accepted_messages", 0), 0)
         totals["pull_rx_total"] += _to_int(row.get("pull_rx", 0), 0)
         totals["push_rx_total"] += _to_int(row.get("push_rx", 0), 0)
@@ -2288,22 +2731,55 @@ def _write_line_figure(export_dir, stem, rows, field, label_fn, title, color="#2
     if not points:
         return None
     export_dir.mkdir(parents=True, exist_ok=True)
+    data_rows = [{"label": label, "value": round(value, 3)} for label, value in points]
     tsv_path = export_dir / "{}.tsv".format(stem)
+    csv_path = export_dir / "{}.csv".format(stem)
     png_path = export_dir / "{}.png".format(stem)
-    _write_tsv(
-        tsv_path,
-        [{"label": label, "value": round(value, 3)} for label, value in points],
-        ["label", "value"],
-    )
+    _write_tsv(tsv_path, data_rows, ["label", "value"])
+    _write_csv(csv_path, data_rows, ["label", "value"])
+    if not WRITE_PNG_FIGURES:
+        return {
+            "png": "",
+            "tsv": "figure_exports/{}.tsv".format(stem),
+            "csv": "figure_exports/{}.csv".format(stem),
+        }
     plt = _matplotlib_pyplot()
-    fig, ax = plt.subplots(figsize=(8.8, 4.8), dpi=180)
+    fig, ax = plt.subplots(figsize=(9.6, 5.2), dpi=220)
+    fig.patch.set_facecolor("#fbfcff")
+    ax.set_facecolor("#ffffff")
     x = list(range(len(points)))
     y = [value for _, value in points]
-    ax.plot(x, y, marker="o", linewidth=2.3, markersize=4.5, color=color)
-    ax.fill_between(x, y, color=color, alpha=0.12)
-    ax.set_title(title, fontsize=12, fontweight="bold")
-    ax.set_xlabel("Sample")
-    ax.set_ylabel(_field_label(field))
+    ax.plot(
+        x,
+        y,
+        marker="o",
+        linewidth=2.8,
+        markersize=4.8,
+        color=color,
+        markerfacecolor="#ffffff",
+        markeredgecolor=color,
+        markeredgewidth=1.4,
+    )
+    ax.fill_between(x, y, color=color, alpha=0.10)
+    if y:
+        min_idx = min(range(len(y)), key=lambda idx: y[idx])
+        max_idx = max(range(len(y)), key=lambda idx: y[idx])
+        for idx, label in [(min_idx, "min"), (max_idx, "max")]:
+            ax.scatter([x[idx]], [y[idx]], s=78, color=color, edgecolor="#18212f", linewidth=0.8, zorder=4)
+            ax.annotate(
+                "{} {}".format(label, _format_display_value(field, y[idx])),
+                xy=(x[idx], y[idx]),
+                xytext=(0, 14 if label == "max" else -22),
+                textcoords="offset points",
+                ha="center",
+                va="center",
+                fontsize=7.5,
+                color="#18212f",
+                bbox=dict(boxstyle="round,pad=0.28", fc="#ffffff", ec="#d9e1ef", alpha=0.95),
+            )
+    ax.set_title(title, fontsize=13, fontweight="bold", color="#18212f", pad=13)
+    ax.set_xlabel("Run", color="#5d6b82")
+    ax.set_ylabel(_field_label(field), color="#5d6b82")
     if len(points) <= 12:
         ticks = x
     else:
@@ -2313,13 +2789,95 @@ def _write_line_figure(export_dir, stem, rows, field, label_fn, title, color="#2
             ticks.append(x[-1])
     ax.set_xticks(ticks)
     ax.set_xticklabels([points[idx][0] for idx in ticks], rotation=35, ha="right", fontsize=8)
-    ax.grid(True, axis="y", linestyle="--", alpha=0.3)
+    ax.grid(True, axis="y", linestyle="--", linewidth=0.8, alpha=0.28)
+    ax.grid(True, axis="x", linestyle=":", linewidth=0.5, alpha=0.12)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.spines["left"].set_color("#d9e1ef")
+    ax.spines["bottom"].set_color("#d9e1ef")
+    ax.tick_params(colors="#5d6b82")
     fig.tight_layout()
     fig.savefig(png_path)
     plt.close(fig)
     return {
         "png": "figure_exports/{}.png".format(stem),
         "tsv": "figure_exports/{}.tsv".format(stem),
+        "csv": "figure_exports/{}.csv".format(stem),
+    }
+
+
+def _write_bar_figure(export_dir, stem, rows, field, title, color="#2474e5"):
+    groups = {}
+    for row in rows:
+        node_count = _to_int(row.get("nodes", 0), 0)
+        value = _maybe_float(row.get(field))
+        if node_count <= 0 or value is None:
+            continue
+        groups.setdefault(node_count, []).append(float(value))
+    if not groups:
+        return None
+    export_dir.mkdir(parents=True, exist_ok=True)
+    data_rows = []
+    for node_count in sorted(groups):
+        values = groups[node_count]
+        data_rows.append(
+            {
+                "nodes": int(node_count),
+                "samples": len(values),
+                "avg": round(statistics.mean(values), 3),
+                "min": round(min(values), 3),
+                "max": round(max(values), 3),
+            }
+        )
+    tsv_path = export_dir / "{}.tsv".format(stem)
+    csv_path = export_dir / "{}.csv".format(stem)
+    png_path = export_dir / "{}.png".format(stem)
+    fields = ["nodes", "samples", "avg", "min", "max"]
+    _write_tsv(tsv_path, data_rows, fields)
+    _write_csv(csv_path, data_rows, fields)
+    if not WRITE_PNG_FIGURES:
+        return {
+            "png": "",
+            "tsv": "figure_exports/{}.tsv".format(stem),
+            "csv": "figure_exports/{}.csv".format(stem),
+        }
+    plt = _matplotlib_pyplot()
+    fig, ax = plt.subplots(figsize=(7.8, 4.8), dpi=220)
+    fig.patch.set_facecolor("#fbfcff")
+    ax.set_facecolor("#ffffff")
+    labels = ["N{}".format(row["nodes"]) for row in data_rows]
+    values = [float(row["avg"]) for row in data_rows]
+    x = list(range(len(values)))
+    bars = ax.bar(x, values, color=color, alpha=0.88, width=0.58)
+    for bar, value in zip(bars, values):
+        ax.annotate(
+            _format_display_value(field, value),
+            xy=(bar.get_x() + bar.get_width() / 2.0, value),
+            xytext=(0, 8),
+            textcoords="offset points",
+            ha="center",
+            va="bottom",
+            fontsize=8,
+            color="#18212f",
+        )
+    ax.set_title(title, fontsize=13, fontweight="bold", color="#18212f", pad=13)
+    ax.set_xlabel("Node Count", color="#5d6b82")
+    ax.set_ylabel("Average {}".format(_field_label(field)), color="#5d6b82")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels)
+    ax.grid(True, axis="y", linestyle="--", linewidth=0.8, alpha=0.26)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.spines["left"].set_color("#d9e1ef")
+    ax.spines["bottom"].set_color("#d9e1ef")
+    ax.tick_params(colors="#5d6b82")
+    fig.tight_layout()
+    fig.savefig(png_path)
+    plt.close(fig)
+    return {
+        "png": "figure_exports/{}.png".format(stem),
+        "tsv": "figure_exports/{}.tsv".format(stem),
+        "csv": "figure_exports/{}.csv".format(stem),
     }
 
 
@@ -2327,10 +2885,14 @@ def _write_timeline_figure(export_dir, timeline_rows):
     rows = [row for row in timeline_rows if _maybe_float(row.get("time_sec")) is not None]
     export_dir.mkdir(parents=True, exist_ok=True)
     tsv_path = export_dir / "timeline.tsv"
+    csv_path = export_dir / "timeline.csv"
     png_path = export_dir / "timeline.png"
     _write_tsv(tsv_path, timeline_rows, TIMELINE_FIELDS)
+    _write_csv(csv_path, timeline_rows, TIMELINE_FIELDS)
     if not rows:
-        return {"png": "", "tsv": "figure_exports/timeline.tsv"}
+        return {"png": "", "tsv": "figure_exports/timeline.tsv", "csv": "figure_exports/timeline.csv"}
+    if not WRITE_PNG_FIGURES:
+        return {"png": "", "tsv": "figure_exports/timeline.tsv", "csv": "figure_exports/timeline.csv"}
     plt = _matplotlib_pyplot()
     fig, ax = plt.subplots(figsize=(8.8, 3.8), dpi=180)
     y_positions = list(range(len(rows)))
@@ -2349,6 +2911,7 @@ def _write_timeline_figure(export_dir, timeline_rows):
     return {
         "png": "figure_exports/timeline.png",
         "tsv": "figure_exports/timeline.tsv",
+        "csv": "figure_exports/timeline.csv",
     }
 
 
@@ -2361,6 +2924,8 @@ def _write_figure_readme(export_dir, title, lines):
 
 
 def _write_run_figure_exports(run_dir, history_totals_rows, local_history, far_history, timeline_rows):
+    if not WRITE_RUN_FIGURES:
+        return []
     export_dir = run_dir / "figure_exports"
     links = []
     created = []
@@ -2374,36 +2939,90 @@ def _write_run_figure_exports(run_dir, history_totals_rows, local_history, far_h
         if not payload:
             continue
         if payload.get("png"):
-            links.append((Path(payload["png"]).name, payload["png"]))
+            links.append((payload["png"], payload["png"]))
             created.append(payload["png"])
         if payload.get("tsv"):
-            links.append((Path(payload["tsv"]).name, payload["tsv"]))
+            links.append((payload["tsv"], payload["tsv"]))
             created.append(payload["tsv"])
+        if payload.get("csv"):
+            links.append((payload["csv"], payload["csv"]))
+            created.append(payload["csv"])
     readme_href = _write_figure_readme(export_dir, "Run Figure Exports", created or ["No figures were generated for this run."])
     links.insert(0, ("figure_exports/README.md", readme_href))
     return links
 
 
-def _write_suite_figure_exports(report_dir, summary_rows):
+def _write_suite_figure_exports(report_dir, summary_rows, full=True):
+    if not WRITE_SUITE_FIGURES:
+        return []
     export_dir = report_dir / "figure_exports"
     links = []
     created = []
+    colors = ["#2474e5", "#118a7e", "#c58f10", "#c73a3a", "#8b4cd6", "#ff7a59"]
     figure_specs = [
-        ("suite_total_mb", "total_mb", "Suite Total MB By Run", "#ff7a59"),
-        ("suite_detection_speed", "detection_speed_sec", "Suite Detection Speed By Run", "#2474e5"),
+        ("suite_total_mb", "total_mb", "Suite Overhead MB By Run", "#ff7a59"),
+        ("suite_detection_speed", "detection_speed_sec", "Suite Detection Latency By Run", "#2474e5"),
         ("suite_failures", "tx_fail_total", "Suite TX Failures By Run", "#c73a3a"),
         ("suite_false_positive_nodes", "false_positive_nodes", "Suite False Positive Nodes By Run", "#8b4cd6"),
         ("suite_false_unavailable_refs", "false_unavailable_refs", "Suite False Unavailable Refs By Run", "#c58f10"),
         ("suite_settle_accuracy", "settle_accuracy_pct", "Suite Settle Accuracy By Run", "#118a7e"),
     ]
+    if full:
+        existing_fields = {field for _, field, _, _ in figure_specs}
+        for idx, field in enumerate(SUMMARY_CHART_FIELDS):
+            if field in existing_fields:
+                continue
+            figure_specs.append(
+                (
+                    "suite_{}".format(field),
+                    field,
+                    "Suite {} By Run".format(_field_label(field)),
+                    colors[idx % len(colors)],
+                )
+            )
     for stem, field, title, color in figure_specs:
         payload = _write_line_figure(export_dir, stem, summary_rows, field, _run_label, title, color=color)
         if not payload:
             continue
-        links.append((Path(payload["png"]).name, payload["png"]))
-        links.append((Path(payload["tsv"]).name, payload["tsv"]))
-        created.extend([payload["png"], payload["tsv"]])
-    readme_href = _write_figure_readme(export_dir, "Suite Figure Exports", created or ["No figures were generated for this suite."])
+        if payload.get("png"):
+            links.append((payload["png"], payload["png"]))
+            created.append(payload["png"])
+        if payload.get("tsv"):
+            links.append((payload["tsv"], payload["tsv"]))
+            created.append(payload["tsv"])
+        if payload.get("csv"):
+            links.append((payload["csv"], payload["csv"]))
+            created.append(payload["csv"])
+
+    grouped_specs = []
+    if full:
+        grouped_specs = [
+            ("nodecount_avg_total_mb", "total_mb", "Average Overhead By Node Count", "#ff7a59"),
+            ("nodecount_avg_detection_speed", "detection_speed_sec", "Average Detection Latency By Node Count", "#2474e5"),
+            ("nodecount_avg_failures", "tx_fail_total", "Average TX Failures By Node Count", "#c73a3a"),
+            ("nodecount_avg_timeouts", "tx_timeout_total", "Average Timeouts By Node Count", "#8b4cd6"),
+            ("nodecount_avg_false_positive_nodes", "false_positive_nodes", "Average False Positives By Node Count", "#c58f10"),
+            ("nodecount_avg_false_unavailable_refs", "false_unavailable_refs", "Average False Unavailable Refs By Node Count", "#7a5ad8"),
+            ("nodecount_avg_settle_accuracy", "settle_accuracy_pct", "Average Settle Accuracy By Node Count", "#118a7e"),
+            ("nodecount_avg_reachable_nodes", "reachable_nodes", "Average Reachable Nodes By Node Count", "#0f7a5b"),
+        ]
+    for stem, field, title, color in grouped_specs:
+        payload = _write_bar_figure(export_dir, stem, summary_rows, field, title, color=color)
+        if not payload:
+            continue
+        if payload.get("png"):
+            links.append((payload["png"], payload["png"]))
+            created.append(payload["png"])
+        if payload.get("tsv"):
+            links.append((payload["tsv"], payload["tsv"]))
+            created.append(payload["tsv"])
+        if payload.get("csv"):
+            links.append((payload["csv"], payload["csv"]))
+            created.append(payload["csv"])
+
+    readme_lines = list(created) if created else ["No figures were generated for this suite."]
+    readme_lines.append("CSV files can be uploaded directly into Google Sheets.")
+    readme_href = _write_figure_readme(export_dir, "Suite Figure Exports", readme_lines)
     links.insert(0, ("figure_exports/README.md", readme_href))
     return links
 
@@ -2499,8 +3118,8 @@ def _node_spotlight_payload(evidence, watch_ports=None):
         row["recent_msgs"] = state.get("recent_msgs", [])[-15:] if isinstance(state.get("recent_msgs"), list) else []
         row["recent_alerts"] = state.get("recent_alerts", [])[-10:] if isinstance(state.get("recent_alerts"), list) else []
         row["pull_cycles"] = _to_int(state.get("pull_cycles", 0), 0)
-        row["incoming_events_count"] = len(state.get("incoming_events", [])) if isinstance(state.get("incoming_events"), list) else 0
-        row["known_nodes_count"] = len(state.get("known_nodes", [])) if isinstance(state.get("known_nodes"), list) else 0
+        row["incoming_events_count"] = len(state.get("incoming_events", [])) if isinstance(state.get("incoming_events"), list) else _to_int(state.get("incoming_events_count", 0), 0)
+        row["known_nodes_count"] = len(state.get("known_nodes", [])) if isinstance(state.get("known_nodes"), list) else _to_int(state.get("known_nodes_count", 0), 0)
         row["watch_role"] = watch_map.get(int(row["port"]), "")
         summary_bits = [str(row["port"])]
         if row["watch_role"]:
@@ -2518,10 +3137,10 @@ def _render_field_reference_html():
         (
             "Core Terms",
             [
-                ("TX", "Traffic sent by the node."),
-                ("RX", "Traffic received by the node."),
-                ("Pull", "Polling traffic where one node asks another node for state."),
-                ("Push", "Dissemination traffic sent without first being asked."),
+                ("TX", "Messages or bytes sent by the node."),
+                ("RX", "Messages or bytes received by the node."),
+                ("Pull", "Polling messages where one node asks another node for state."),
+                ("Push", "Dissemination messages sent without first being asked."),
                 ("LOCAL", "The watched node closest to the scenario focus or first impact area."),
                 ("FAR", "The watched node farthest from LOCAL, useful for propagation and scaling."),
             ],
@@ -2538,7 +3157,7 @@ def _render_field_reference_html():
                 ("Reachable", "How many nodes answered when evidence was collected."),
                 ("Total Nodes", "How many nodes were expected in the network."),
                 ("Events", "Logged scenario actions such as stage changes, faults, or resets."),
-                ("Detection Speed", "Seconds until the LOCAL watch first shows a hazard signal."),
+                ("Detection Latency", "Seconds until the LOCAL watch first shows a hazard signal."),
                 ("First Watch / First Impact / Outage / Recovery / Reset", "The key timeline milestones pulled into the run timeline strip."),
                 ("TX Fail / TX Timeout / Conn Err", "Send-side problems seen during the run."),
                 ("Status", "Overall outcome, usually OK, WARN, or FAIL."),
@@ -2555,7 +3174,7 @@ def _render_field_reference_html():
             ],
         ),
         (
-            "Traffic And Overhead",
+            "Overhead And Data Volume",
             [
                 ("RX Bytes", "Total bytes received by the node."),
                 ("TX Bytes", "Total bytes sent by the node."),
@@ -2609,6 +3228,37 @@ def _render_field_reference_html():
 </section>""".format("".join(cards))
 
 
+def _render_phase_guide_html():
+    phases = [
+        (
+            "Phase 1: Baseline",
+            "No destructive event is injected. This measures clean steady-state behavior, idle overhead, throughput, reachability, and per-node load.",
+        ),
+        (
+            "Phase 2: Fire Spread And Bomb",
+            "A topology-aware ignition starts near the center, spreads outward in hop-based rings, temporarily marks a bomb core, then trails recovery behind the front.",
+        ),
+        (
+            "Phase 3: Tornado Hazard Sensing",
+            "A moving tornado band sweeps across the grid. LOCAL watches the impact path while FAR shows how information propagates away from the hazard.",
+        ),
+        (
+            "Phase 4: Adversarial Stress",
+            "The runner injects false unavailability, noisy or lying sensors, and unstable/flapping behavior to test resilience and recovery under bad conditions.",
+        ),
+    ]
+    cards = []
+    for title, body in phases:
+        cards.append('<div class="guide-card"><h3>{}</h3><p>{}</p></div>'.format(escape(title), escape(body)))
+    return """<section class="panel">
+<div class="panel-head">
+  <h2>Four Phase Guide</h2>
+  <p class="section-note">Each all-together batch runs these four phases in order, so one batch produces one Baseline, one Fire, one Tornado, and one Stress result.</p>
+</div>
+<div class="guide-grid">{}</div>
+</section>""".format("".join(cards))
+
+
 def _render_glossary_html():
     cards = [
         (
@@ -2616,8 +3266,8 @@ def _render_glossary_html():
             "LOCAL is the watched node closest to the scenario focus. FAR is the watched node farthest from LOCAL, which helps show propagation instead of direct impact.",
         ),
         (
-            "Speed",
-            "Use active time, early chart slope, accepted messages, and pull or push growth to see how quickly information spreads and stabilizes.",
+            "Throughput",
+            "Use pull/push RX and TX growth, accepted messages, and the early chart slope to see how much useful protocol work happens per unit time.",
         ),
         (
             "Resilience",
@@ -2625,7 +3275,7 @@ def _render_glossary_html():
         ),
         (
             "Overhead",
-            "Use total bytes, total MB, pull RX or TX, and push RX or TX to measure message cost on a node or across a run.",
+            "Use total bytes, total MB, pull RX or TX, and push RX or TX to measure message cost on a node or across a run. This is protocol overhead, not link capacity.",
         ),
         (
             "Scalability",
@@ -2638,7 +3288,7 @@ def _render_glossary_html():
     ]
 
     guide_rows = [
-        ("Speed", "active_duration_sec, accepted_messages, pull or push history", "Faster runs usually show earlier, steeper growth with fewer stalls."),
+        ("Throughput", "accepted_messages, pull_rx, push_rx, pull_tx, push_tx over time", "Higher useful message progress over the same time window means stronger throughput."),
         ("Resilience", "reachable_nodes, tx_fail_total, tx_timeout_total, current_missing_count, false_unavailable_refs", "More failures or missing neighbors usually means weaker fault tolerance."),
         ("Overhead", "total_mb, total_bytes, pull_rx or tx, push_rx or tx", "Lower MB with similar coverage is a stronger efficiency story."),
         ("Accuracy", "phase, direction_label, boundary_kind, false_positive_nodes, settle_accuracy_pct", "Consistency, correct state interpretation, and low residual alerts support stronger hazard sensing claims."),
@@ -2701,7 +3351,7 @@ def _render_timeline_panel(timeline_rows):
     return """<section class="panel">
 <div class="panel-head">
   <h2>True Event Timeline</h2>
-  <p class="section-note">This strip lines up the scenario milestones that matter most for speed and resilience: ignition, first watch, first impact, outage, recovery, and reset.</p>
+  <p class="section-note">This strip lines up the scenario milestones that matter most for detection latency and resilience: ignition, first watch, first impact, outage, recovery, and reset.</p>
 </div>
 <div class="timeline-strip">{items}</div>
 <div class="table-wrap" style="margin-top:14px;">
@@ -2754,6 +3404,353 @@ def _render_fire_semantics_panel(fire_stage_rows):
   </table>
 </div>
 </section>""".format(rows=rows_html)
+
+
+def _grid_side_for_count(count):
+    count = max(1, _to_int(count, 1))
+    root = int(math.isqrt(int(count)))
+    if root * root == int(count):
+        return int(root)
+    return int(math.ceil(math.sqrt(float(count))))
+
+
+def _visual_replay_layout(node_rows, watch_ports=None):
+    watch_ports = watch_ports or {}
+    local_port = _to_int(watch_ports.get("LOCAL", 0), 0)
+    far_port = _to_int(watch_ports.get("FAR", 0), 0)
+    ordered = sorted(node_rows or [], key=lambda row: _to_int(row.get("port", 0), 0))
+    grid = _grid_side_for_count(len(ordered) or 1)
+    out = []
+    for idx, row in enumerate(ordered):
+        port = _to_int(row.get("port", 0), 0)
+        r = idx // grid
+        c = idx % grid
+        watch_role = ""
+        if port == local_port:
+            watch_role = "LOCAL"
+        elif port == far_port:
+            watch_role = "FAR"
+        out.append(
+            {
+                "port": int(port),
+                "x": round(float(c) + (0.5 if (r % 2 == 1) else 0.0), 3),
+                "y": round(float(r) * 0.9, 3),
+                "row": int(r),
+                "col": int(c),
+                "watch_role": watch_role,
+            }
+        )
+    return out
+
+
+def _render_visual_replay_panel(manifest, node_rows, history_rows, timeline_rows, fire_stage_rows):
+    if not HTML_REPLAY:
+        return "", ""
+    if not node_rows or not history_rows:
+        return "", ""
+
+    nodes_payload = _visual_replay_layout(node_rows, manifest.get("watch_ports", {}))
+    history_payload = []
+    for row in history_rows:
+        history_payload.append(
+            {
+                "sample_index": _to_int(row.get("sample_index", 0), 0),
+                "sample_sec": round(_to_float(row.get("sample_sec", 0.0), 0.0), 3),
+                "sample_label": str(row.get("sample_label", "")),
+                "port": _to_int(row.get("port", 0), 0),
+                "reachable": bool(row.get("reachable", False)),
+                "protocol_state": str(row.get("protocol_state", "")),
+                "phase": str(row.get("phase", "")),
+                "accepted_messages": _to_int(row.get("accepted_messages", 0), 0),
+                "pull_rx": _to_int(row.get("pull_rx", 0), 0),
+                "push_rx": _to_int(row.get("push_rx", 0), 0),
+                "pull_tx": _to_int(row.get("pull_tx", 0), 0),
+                "push_tx": _to_int(row.get("push_tx", 0), 0),
+                "total_bytes": _to_int(row.get("total_bytes", 0), 0),
+                "total_mb": round(_to_float(row.get("total_mb", 0.0), 0.0), 3),
+                "current_missing_count": _to_int(row.get("current_missing_count", 0), 0),
+                "crash_sim": bool(row.get("crash_sim", False)),
+                "lie_sensor": bool(row.get("lie_sensor", False)),
+                "flap": bool(row.get("flap", False)),
+                "error": str(row.get("error", "")),
+            }
+        )
+
+    panel_html = """<section class="panel">
+<div class="panel-head">
+  <h2>Visual Replay</h2>
+  <p class="section-note">This replay uses the sampled node pulls captured during the run. Scrub time, click a node, and the page will sync that node into Node Spotlight below.</p>
+</div>
+<div class="replay-controls">
+  <button type="button" id="replay-play" class="replay-button">Play</button>
+  <input id="replay-slider" type="range" min="0" step="1" value="0">
+  <div id="replay-frame-label" class="badge">t+0.0s</div>
+</div>
+<div class="replay-shell">
+  <div class="replay-card">
+    <div class="replay-meta" id="replay-meta"></div>
+    <div class="replay-legend">
+      <span class="legend-chip"><span class="legend-swatch" style="background:#cbd5e1;"></span>Unreachable</span>
+      <span class="legend-chip"><span class="legend-swatch" style="background:#66a6ff;"></span>Normal</span>
+      <span class="legend-chip"><span class="legend-swatch" style="background:#ff8a5b;"></span>Alert / Alarmed</span>
+      <span class="legend-chip"><span class="legend-swatch" style="background:#3dbb8b;"></span>Recovering / Surveying</span>
+      <span class="legend-chip"><span class="legend-swatch" style="background:#ef4444;"></span>On Fire / Destroyed</span>
+    </div>
+    <div id="replay-svg-host" class="replay-svg-wrap"></div>
+  </div>
+  <div class="replay-card">
+    <h3>Frame Context</h3>
+    <div id="replay-stage" class="replay-stage">
+      <div class="replay-stage-title">Timeline Context</div>
+      <div id="replay-stage-note" class="replay-stage-note">Move the replay slider to inspect the run over time.</div>
+    </div>
+    <div id="replay-node-detail" class="micro-grid"></div>
+    <ul id="replay-detail-list" class="replay-detail-list"></ul>
+  </div>
+</div>
+</section>"""
+
+    script_html = """<script type="application/json" id="replay-layout-data">{nodes_json}</script>
+<script type="application/json" id="replay-history-data">{history_json}</script>
+<script type="application/json" id="replay-timeline-data">{timeline_json}</script>
+<script type="application/json" id="replay-fire-data">{fire_json}</script>
+<script>
+(() => {{
+  const nodes = JSON.parse(document.getElementById('replay-layout-data').textContent || '[]');
+  const rows = JSON.parse(document.getElementById('replay-history-data').textContent || '[]');
+  if (!nodes.length || !rows.length) return;
+  const timelineRows = JSON.parse(document.getElementById('replay-timeline-data').textContent || '[]');
+  const fireRows = JSON.parse(document.getElementById('replay-fire-data').textContent || '[]');
+  const slider = document.getElementById('replay-slider');
+  const playButton = document.getElementById('replay-play');
+  const frameLabel = document.getElementById('replay-frame-label');
+  const metaHost = document.getElementById('replay-meta');
+  const svgHost = document.getElementById('replay-svg-host');
+  const stageNoteHost = document.getElementById('replay-stage-note');
+  const nodeDetailHost = document.getElementById('replay-node-detail');
+  const detailListHost = document.getElementById('replay-detail-list');
+  const spotlightSelect = document.getElementById('spotlight-port-select');
+  const framesByIndex = new Map();
+  const intFmt = new Intl.NumberFormat('en-US');
+  let timer = null;
+  let selectedPort = String((nodes.find((item) => item.watch_role === 'LOCAL') || nodes[0]).port);
+
+  function toNum(value) {{
+    const num = Number(value);
+    return Number.isFinite(num) ? num : null;
+  }}
+
+  function fmt(field, value) {{
+    if (value === null || value === undefined || Number.isNaN(value)) return 'n/a';
+    if (field.endsWith('_mb')) return value.toFixed(3) + ' MB';
+    if (field.includes('bytes')) return intFmt.format(Math.round(value));
+    if (Math.abs(value - Math.round(value)) < 1e-9) return intFmt.format(Math.round(value));
+    return value.toFixed(3);
+  }}
+
+  function stateColor(state, reachable) {{
+    if (!reachable) return '#cbd5e1';
+    const key = String(state || '').toUpperCase();
+    if (key === 'NORMAL' || key === 'CLEAR') return '#66a6ff';
+    if (key === 'ALERT' || key === 'ALARMED') return '#ff8a5b';
+    if (key === 'RECOVERING' || key === 'SURVEYING') return '#3dbb8b';
+    if (key === 'ON_FIRE' || key === 'DESTROYED') return '#ef4444';
+    return '#a78bfa';
+  }}
+
+  function parseFirstTime(windowValue) {{
+    const match = String(windowValue || '').match(/([0-9]+(?:\\.[0-9]+)?)s/);
+    return match ? Number(match[1]) : null;
+  }}
+
+  rows.forEach((row) => {{
+    const idx = Number(row.sample_index) || 0;
+    if (!framesByIndex.has(idx)) {{
+      framesByIndex.set(idx, {{
+        sample_index: idx,
+        sample_sec: Number(row.sample_sec) || 0,
+        sample_label: String(row.sample_label || ''),
+        byPort: {{}},
+      }});
+    }}
+    framesByIndex.get(idx).byPort[String(row.port)] = row;
+  }});
+  const frames = Array.from(framesByIndex.values()).sort((a, b) => a.sample_index - b.sample_index);
+  slider.max = String(Math.max(0, frames.length - 1));
+
+  function currentFrame() {{
+    const idx = Math.max(0, Math.min(frames.length - 1, Number(slider.value) || 0));
+    return frames[idx];
+  }}
+
+  function hexPoints(cx, cy, radius) {{
+    const points = [];
+    for (let i = 0; i < 6; i += 1) {{
+      const angle = ((60 * i) - 30) * Math.PI / 180;
+      points.push(`${{(cx + radius * Math.cos(angle)).toFixed(2)}},${{(cy + radius * Math.sin(angle)).toFixed(2)}}`);
+    }}
+    return points.join(' ');
+  }}
+
+  function syncSpotlight(port) {{
+    if (!spotlightSelect) return;
+    spotlightSelect.value = String(port);
+    spotlightSelect.dispatchEvent(new Event('change', {{ bubbles: true }}));
+  }}
+
+  function timelineContext(sampleSec) {{
+    const past = timelineRows
+      .map((row) => ({{ milestone: row.milestone, time_sec: toNum(row.time_sec), detail: row.detail || '' }}))
+      .filter((row) => row.time_sec !== null && row.time_sec <= sampleSec)
+      .sort((a, b) => a.time_sec - b.time_sec);
+    const latest = past.length ? past[past.length - 1] : null;
+    const firePast = fireRows
+      .map((row) => ({{ stage: row.stage, at_sec: parseFirstTime(row.time_window), detail: row.detail || '' }}))
+      .filter((row) => row.at_sec !== null && row.at_sec <= sampleSec)
+      .sort((a, b) => a.at_sec - b.at_sec);
+    const fireStage = firePast.length ? firePast[firePast.length - 1] : null;
+    if (fireStage) {{
+      return `<strong>${{fireStage.stage}}</strong> · ${{fireStage.detail || 'fire stage active'}}`;
+    }}
+    if (latest) {{
+      return `<strong>${{latest.milestone}}</strong> · ${{latest.detail || 'timeline milestone reached'}}`;
+    }}
+    return 'The run is before the first major recorded milestone.';
+  }}
+
+  function render() {{
+    const frame = currentFrame();
+    if (!frame) return;
+    frameLabel.textContent = `${{frame.sample_label}} · sample ${{frame.sample_index + 1}} / ${{frames.length}}`;
+    metaHost.innerHTML = [
+      `<span class="badge">Time ${{frame.sample_label}}</span>`,
+      `<span class="badge">Nodes ${{nodes.length}}</span>`,
+      `<span class="badge">Selected Port ${{selectedPort}}</span>`,
+    ].join('');
+    stageNoteHost.innerHTML = timelineContext(frame.sample_sec);
+
+    const minX = Math.min(...nodes.map((node) => node.x));
+    const maxX = Math.max(...nodes.map((node) => node.x));
+    const minY = Math.min(...nodes.map((node) => node.y));
+    const maxY = Math.max(...nodes.map((node) => node.y));
+    const stepX = 70;
+    const stepY = 72;
+    const pad = 38;
+    const width = ((maxX - minX + 1) * stepX) + pad * 2 + 30;
+    const height = ((maxY - minY + 1) * stepY) + pad * 2 + 26;
+    const radius = 21;
+    const nodesSvg = nodes.map((node) => {{
+      const row = frame.byPort[String(node.port)] || null;
+      const cx = pad + ((node.x - minX) * stepX);
+      const cy = pad + ((node.y - minY) * stepY);
+      const watchClass = node.watch_role ? ' is-watch' : '';
+      const selectedClass = String(node.port) === String(selectedPort) ? ' is-selected' : '';
+      const fill = stateColor(row ? row.protocol_state : '', row ? row.reachable : false);
+      const watchStroke = node.watch_role === 'LOCAL' ? '#ff7a59' : (node.watch_role === 'FAR' ? '#2474e5' : 'rgba(15, 23, 42, 0.16)');
+      const label = String(node.port).slice(-2);
+      const tooltip = row
+        ? `${{node.port}} | ${{
+            row.protocol_state || 'UNKNOWN'
+          }} | accepted ${{
+            row.accepted_messages
+          }} | bytes ${{
+            row.total_bytes
+          }} | ${{
+            frame.sample_label
+          }}`
+        : `${{node.port}} | no sample`;
+      return `<g class="replay-node${{watchClass}}${{selectedClass}}" data-replay-port="${{node.port}}" tabindex="0">
+        <polygon class="replay-node-shape" points="${{hexPoints(cx, cy, radius)}}" fill="${{fill}}" stroke="${{watchStroke}}">
+          <title>${{tooltip}}</title>
+        </polygon>
+        <text class="replay-node-label" x="${{cx.toFixed(2)}}" y="${{(cy + 3).toFixed(2)}}" text-anchor="middle">${{label}}</text>
+      </g>`;
+    }}).join('');
+    svgHost.innerHTML = `<svg viewBox="0 0 ${{width}} ${{height}}" class="replay-svg" role="img" aria-label="run replay map">${{nodesSvg}}</svg>`;
+
+    const selected = frame.byPort[String(selectedPort)] || frame.byPort[String(nodes[0].port)] || null;
+    if (selected) {{
+      nodeDetailHost.innerHTML = [
+        ['Port', selected.port],
+        ['State', selected.protocol_state || 'UNKNOWN'],
+        ['Accepted', fmt('accepted_messages', selected.accepted_messages)],
+        ['Overhead', fmt('total_mb', toNum(selected.total_mb))],
+        ['Missing', fmt('current_missing_count', selected.current_missing_count)],
+        ['Phase', selected.phase || 'n/a'],
+      ].map((card) => `<div class="micro-card"><div class="micro-label">${{card[0]}}</div><div class="micro-value">${{card[1]}}</div></div>`).join('');
+      detailListHost.innerHTML = [
+        `<li><strong>Time:</strong> ${{
+          frame.sample_label
+        }} (${{
+          fmt('sample_sec', frame.sample_sec)
+        }}s)</li>`,
+        `<li><strong>Pull:</strong> RX ${{
+          fmt('pull_rx', selected.pull_rx)
+        }} · TX ${{
+          fmt('pull_tx', selected.pull_tx)
+        }}</li>`,
+        `<li><strong>Push:</strong> RX ${{
+          fmt('push_rx', selected.push_rx)
+        }} · TX ${{
+          fmt('push_tx', selected.push_tx)
+        }}</li>`,
+        `<li><strong>Faults:</strong> crash=${{selected.crash_sim ? 'on' : 'off'}}, lie=${{selected.lie_sensor ? 'on' : 'off'}}, flap=${{selected.flap ? 'on' : 'off'}}</li>`,
+        `<li><strong>Note:</strong> Click any node to sync it into Node Spotlight and inspect the raw node log below.</li>`,
+      ].join('');
+    }}
+
+    Array.from(svgHost.querySelectorAll('[data-replay-port]')).forEach((item) => {{
+      const port = item.getAttribute('data-replay-port');
+      const activate = () => {{
+        selectedPort = String(port);
+        render();
+        syncSpotlight(port);
+      }};
+      item.addEventListener('click', activate);
+      item.addEventListener('keydown', (event) => {{
+        if (event.key === 'Enter' || event.key === ' ') {{
+          event.preventDefault();
+          activate();
+        }}
+      }});
+    }});
+  }}
+
+  function setPlaying(nextValue) {{
+    if (timer) {{
+      window.clearInterval(timer);
+      timer = null;
+    }}
+    if (nextValue) {{
+      playButton.textContent = 'Pause';
+      timer = window.setInterval(() => {{
+        const current = Number(slider.value) || 0;
+        if (current >= frames.length - 1) {{
+          setPlaying(false);
+          return;
+        }}
+        slider.value = String(current + 1);
+        render();
+      }}, 700);
+    }} else {{
+      playButton.textContent = 'Play';
+    }}
+  }}
+
+  slider.addEventListener('input', () => {{
+    setPlaying(false);
+    render();
+  }});
+  playButton.addEventListener('click', () => setPlaying(!timer));
+  render();
+}})();
+</script>""".format(
+        nodes_json=escape(json.dumps(nodes_payload)),
+        history_json=escape(json.dumps(history_payload)),
+        timeline_json=escape(json.dumps(timeline_rows or [])),
+        fire_json=escape(json.dumps(fire_stage_rows or [])),
+    )
+    return panel_html, script_html
 
 
 def _render_spotlight_table_html(title, rows, fields, port_field, subtitle=""):
@@ -2986,7 +3983,7 @@ def _build_protocol_comparison_rows():
             status = "Mismatch"
             note = "Match node count and duration before using this row in the paper."
         elif egess_metrics.get("avg_detection_speed") is None or checkin_metrics.get("avg_detection_speed") is None:
-            note = "Detection speed needs fresh history-enabled runs for both protocols."
+            note = "Detection latency needs fresh history-enabled runs for both protocols."
 
         rows.append(
             {
@@ -3075,7 +4072,7 @@ def _render_comparison_panel(comparison_rows):
     panel_html = """<section class="panel">
 <div class="panel-head">
   <h2>Comparison Between Protocols</h2>
-  <p class="section-note">Detection speed uses the first LOCAL watch-node signal after scenario start. Use rows marked Fair for paper-ready comparisons.</p>
+  <p class="section-note">Detection latency uses the first LOCAL watch-node signal after scenario start. Use rows marked Fair for paper-ready comparisons.</p>
 </div>
 <div class="scenario-tab-row">{buttons}</div>
 <div class="table-wrap">
@@ -3242,7 +4239,7 @@ def _render_suite_interactive_panel(summary_rows):
     const selectedLatest = toNum(subset[subset.length - 1][metric]);
     const summaryCards = [
       {{ label: 'Runs Used', value: String(count), note: `of ${{maxRuns}} completed runs` }},
-      {{ label: 'Avg Traffic', value: fmt('total_mb', avg('total_mb', subset)), note: 'selected prefix average' }},
+      {{ label: 'Avg Overhead', value: fmt('total_mb', avg('total_mb', subset)), note: 'selected prefix average' }},
       {{ label: 'Avg Failures', value: fmt('tx_fail_total', avg('tx_fail_total', subset)), note: 'TX failures per run' }},
       {{ label: 'Avg Reachable', value: fmt('reachable_nodes', avg('reachable_nodes', subset)), note: 'reachable nodes per run' }},
       {{ label: `Avg ${{labels[metric] || metric}}`, value: fmt(metric, selectedAvg), note: 'current selected metric' }},
@@ -3258,7 +4255,7 @@ def _render_suite_interactive_panel(summary_rows):
       : 'No numeric data for the selected metric.';
 
     const tableRows = [
-      ['Average Traffic', fmt('total_mb', avg('total_mb', subset))],
+      ['Average Overhead', fmt('total_mb', avg('total_mb', subset))],
       ['Average Failures', fmt('tx_fail_total', avg('tx_fail_total', subset))],
       ['Average Timeouts', fmt('tx_timeout_total', avg('tx_timeout_total', subset))],
       ['Average Reachable Nodes', fmt('reachable_nodes', avg('reachable_nodes', subset))],
@@ -3412,7 +4409,7 @@ def _render_nodecount_panel(summary_rows, watch_rows):
                             "tone": "accent",
                         },
                         {
-                            "label": "Avg Traffic",
+                            "label": "Avg Overhead",
                             "value": _format_display_value("total_mb", avg_mb if avg_mb is not None else 0.0),
                             "note": "average per {}-node run".format(int(count)),
                             "tone": "accent",
@@ -3481,6 +4478,315 @@ def _render_nodecount_panel(summary_rows, watch_rows):
 }})();
 </script>"""
     return panel_html, script_html
+
+
+def _failure_total(row):
+    return (
+        _to_int(row.get("tx_fail_total", 0), 0)
+        + _to_int(row.get("tx_timeout_total", 0), 0)
+        + _to_int(row.get("tx_conn_error_total", 0), 0)
+    )
+
+
+def _best_row_by_number(rows, field, prefer="max", extra_key=None):
+    candidates = []
+    for row in rows:
+        value = _maybe_float(row.get(field))
+        if value is None:
+            continue
+        extra = extra_key(row) if extra_key else 0
+        candidates.append((float(value), extra, row))
+    if not candidates:
+        return None, None
+    reverse = prefer == "max"
+    value, _, row = sorted(candidates, key=lambda item: (item[0], item[1]), reverse=reverse)[0]
+    return value, row
+
+
+def _run_ref(row):
+    return "Run {} @ N{}".format(
+        _format_display_value("run_index", row.get("run_index", "")),
+        _format_display_value("nodes", row.get("nodes", "")),
+    )
+
+
+def _watch_ref(row):
+    return "Run {} @ N{} / port {}".format(
+        _format_display_value("run_index", row.get("run_index", "")),
+        _format_display_value("nodes", row.get("nodes", "")),
+        _format_display_value("watch_port", row.get("watch_port", "")),
+    )
+
+
+def _highlight_row(title, row, value_field, value=None, reason=""):
+    display_value = value if value is not None else row.get(value_field, "")
+    return {
+        "highlight": title,
+        "run": _run_ref(row),
+        "value": _format_display_value(value_field, display_value),
+        "evidence": "seed {} | local {} | far {}".format(
+            _format_display_value("seed", row.get("seed", "")),
+            _format_display_value("local_watch_port", row.get("local_watch_port", "")),
+            _format_display_value("far_watch_port", row.get("far_watch_port", "")),
+        ),
+        "reason": reason,
+    }
+
+
+def _node_highlight_row(title, row, value_field, value=None, reason=""):
+    display_value = value if value is not None else row.get(value_field, "")
+    return {
+        "highlight": title,
+        "view": str(row.get("view", "")),
+        "run": _watch_ref(row),
+        "value": _format_display_value(value_field, display_value),
+        "state": str(row.get("protocol_state", "")),
+        "reason": reason,
+    }
+
+
+def _render_paper_highlights_html(summary_rows, watch_rows):
+    if not summary_rows:
+        return ""
+
+    rows = sorted(summary_rows, key=lambda row: (_to_int(row.get("run_index", 0), 0), _to_int(row.get("nodes", 0), 0)))
+    ok_runs = sum(1 for row in rows if str(row.get("status", "")).strip().lower() == "ok")
+    node_counts = sorted({_to_int(row.get("nodes", 0), 0) for row in rows if _to_int(row.get("nodes", 0), 0) > 0})
+    cards = [
+        {
+            "label": "Evidence Rows",
+            "value": str(len(rows)),
+            "note": "{} node settings".format(len(node_counts)),
+            "tone": "accent",
+        },
+        {
+            "label": "Healthy Runs",
+            "value": "{}/{}".format(ok_runs, len(rows)),
+            "note": "status OK",
+            "tone": "good" if ok_runs == len(rows) else "warn",
+        },
+    ]
+
+    fastest_value, fastest_row = _best_row_by_number(rows, "detection_speed_sec", prefer="min")
+    if fastest_row is not None:
+        cards.append(
+            {
+                "label": "Fastest Detection",
+                "value": _format_display_value("detection_speed_sec", fastest_value),
+                "note": _run_ref(fastest_row),
+                "tone": "good",
+            }
+        )
+
+    settle_value, settle_row = _best_row_by_number(
+        rows,
+        "settle_accuracy_pct",
+        prefer="max",
+        extra_key=lambda row: -float(_to_int(row.get("false_positive_nodes", 0), 0) + _to_int(row.get("false_unavailable_refs", 0), 0)),
+    )
+    if settle_row is not None:
+        cards.append(
+            {
+                "label": "Best Settle",
+                "value": _format_display_value("settle_accuracy_pct", settle_value),
+                "note": _run_ref(settle_row),
+                "tone": "good" if float(settle_value) >= 95.0 else "warn",
+            }
+        )
+
+    overhead_value, overhead_row = _best_row_by_number(rows, "total_mb", prefer="min")
+    if overhead_row is not None:
+        cards.append(
+            {
+                "label": "Lowest Overhead",
+                "value": _format_display_value("total_mb", overhead_value),
+                "note": _run_ref(overhead_row),
+                "tone": "accent",
+            }
+        )
+
+    moment_rows = []
+    if fastest_row is not None:
+        moment_rows.append(
+            _highlight_row(
+                "Fastest detection",
+                fastest_row,
+                "detection_speed_sec",
+                fastest_value,
+                "Earliest local/far hazard signal in the sampled run timeline.",
+            )
+        )
+    if settle_row is not None:
+        moment_rows.append(
+            _highlight_row(
+                "Best recovery",
+                settle_row,
+                "settle_accuracy_pct",
+                settle_value,
+                "{} false positives, {} false unavailable refs.".format(
+                    _format_display_value("false_positive_nodes", settle_row.get("false_positive_nodes", "")),
+                    _format_display_value("false_unavailable_refs", settle_row.get("false_unavailable_refs", "")),
+                ),
+            )
+        )
+    if overhead_row is not None:
+        moment_rows.append(
+            _highlight_row(
+                "Lowest overhead",
+                overhead_row,
+                "total_mb",
+                overhead_value,
+                "Smallest measured combined network MB for this scenario.",
+            )
+        )
+
+    clean_rows = sorted(rows, key=lambda row: (_failure_total(row), _to_float(row.get("total_mb", 0.0), 0.0)))
+    if clean_rows:
+        clean_row = clean_rows[0]
+        moment_rows.append(
+            _highlight_row(
+                "Cleanest run",
+                clean_row,
+                "tx_fail_total",
+                _failure_total(clean_row),
+                "Failure + timeout + connection-error total is lowest in the suite.",
+            )
+        )
+
+    reach_rows = [
+        row
+        for row in rows
+        if _to_int(row.get("total_nodes", 0), 0) > 0 and _to_int(row.get("reachable_nodes", 0), 0) >= 0
+    ]
+    if reach_rows:
+        reach_row = sorted(
+            reach_rows,
+            key=lambda row: (
+                _to_int(row.get("reachable_nodes", 0), 0) / max(1, _to_int(row.get("total_nodes", 0), 0)),
+                _to_int(row.get("nodes", 0), 0),
+            ),
+            reverse=True,
+        )[0]
+        moment_rows.append(
+            _highlight_row(
+                "Best reachability",
+                reach_row,
+                "reachable_nodes",
+                reach_row.get("reachable_nodes", ""),
+                "{} of {} nodes reachable at final sample.".format(
+                    _format_display_value("reachable_nodes", reach_row.get("reachable_nodes", "")),
+                    _format_display_value("total_nodes", reach_row.get("total_nodes", "")),
+                ),
+            )
+        )
+
+    event_value, event_row = _best_row_by_number(rows, "events_total", prefer="max")
+    if event_row is not None:
+        moment_rows.append(
+            _highlight_row(
+                "Richest event trace",
+                event_row,
+                "events_total",
+                event_value,
+                "{} fault ops and {} trigger ops captured.".format(
+                    _format_display_value("fault_ops", event_row.get("fault_ops", "")),
+                    _format_display_value("trigger_ops", event_row.get("trigger_ops", "")),
+                ),
+            )
+        )
+
+    node_rows = []
+    watch_candidates = [row for row in watch_rows if not str(row.get("error", "")).strip()]
+    accepted_value, accepted_row = _best_row_by_number(watch_candidates, "accepted_messages", prefer="max")
+    if accepted_row is not None:
+        node_rows.append(
+            _node_highlight_row(
+                "Most accepted messages",
+                accepted_row,
+                "accepted_messages",
+                accepted_value,
+                "Useful node for explaining active protocol traffic.",
+            )
+        )
+    traffic_value, traffic_row = _best_row_by_number(watch_candidates, "total_mb", prefer="max")
+    if traffic_row is not None:
+        node_rows.append(
+            _node_highlight_row(
+                "Highest watched traffic",
+                traffic_row,
+                "total_mb",
+                traffic_value,
+                "Best watched node for overhead discussion.",
+            )
+        )
+    local_watch = [row for row in watch_candidates if str(row.get("view", "")).strip().upper() == "LOCAL"]
+    local_value, local_row = _best_row_by_number(local_watch, "accepted_messages", prefer="max")
+    if local_row is not None:
+        node_rows.append(
+            _node_highlight_row(
+                "Strong local witness",
+                local_row,
+                "accepted_messages",
+                local_value,
+                "Local watched node with the most accepted protocol messages.",
+            )
+        )
+    far_watch = [row for row in watch_candidates if str(row.get("view", "")).strip().upper() == "FAR"]
+    far_value, far_row = _best_row_by_number(far_watch, "accepted_messages", prefer="max")
+    if far_row is not None:
+        node_rows.append(
+            _node_highlight_row(
+                "Strong far witness",
+                far_row,
+                "accepted_messages",
+                far_value,
+                "Far watched node with the most accepted protocol messages.",
+            )
+        )
+    stable_watch = [
+        row
+        for row in watch_candidates
+        if _boolish(row.get("reachable", "")) is True
+        and str(row.get("protocol_state", "")).strip().upper() in ("MONITORING", "LISTENING", "PULL")
+    ]
+    stable_value, stable_row = _best_row_by_number(stable_watch, "total_mb", prefer="min")
+    if stable_row is not None:
+        node_rows.append(
+            _node_highlight_row(
+                "Lowest stable watched traffic",
+                stable_row,
+                "total_mb",
+                stable_value,
+                "Reachable watched node with low measured MB.",
+            )
+        )
+
+    sections = [
+        _render_cards_html(cards),
+        _render_table_html(
+            "Best Run Moments",
+            moment_rows,
+            ["highlight", "run", "value", "evidence", "reason"],
+            "Use these rows when choosing screenshots, captions, and paper examples.",
+        ),
+    ]
+    if node_rows:
+        sections.append(
+            _render_table_html(
+                "Highlighted Watched Nodes",
+                node_rows,
+                ["highlight", "view", "run", "value", "state", "reason"],
+                "These are lightweight node highlights kept even in lean-graphs mode.",
+            )
+        )
+
+    return """<section class="panel">
+<div class="panel-head">
+  <h2>Paper Highlights</h2>
+  <p class="section-note">Strong evidence points for the evaluation: fast detection, clean recovery, low overhead, reachability, and watched-node activity.</p>
+</div>
+{sections}
+</section>""".format(sections="".join(sections))
 
 
 def _render_node_spotlight_panel(evidence, history_rows, watch_ports=None, node_logs=None):
@@ -3711,21 +5017,21 @@ fmt(metricSelect.value || 'pull_rx', point.point.value)
     const tags = [
       watchRole ? `${{watchRole}} WATCH` : 'REGULAR',
       node.reachable ? 'REACHABLE' : 'UNREACHABLE',
-      `Traffic rank #${{bytesRank || 'n/a'}}`,
+      `Overhead rank #${{bytesRank || 'n/a'}}`,
       `Msg rank #${{acceptedRank || 'n/a'}}`,
     ];
 
     titleHost.textContent = `Port ${{port}}`;
-    subtitleHost.textContent = `${{roleText}} · ${{node.protocol_state || 'UNKNOWN'}} · ${{fmt('total_mb', toNum(node.total_mb))}} traffic · ${{sampleCount}} history samples`;
+    subtitleHost.textContent = `${{roleText}} · ${{node.protocol_state || 'UNKNOWN'}} · ${{fmt('total_mb', toNum(node.total_mb))}} overhead · ${{sampleCount}} history samples`;
     tagsHost.innerHTML = tags.map(tag => `<span class="badge pill-soft">${{tag}}</span>`).join('');
 
     const cards = [
       {{ label: 'Role', value: watchRole || 'REGULAR', note: watchRole ? 'watched node in the paper report' : 'ordinary node' }},
       {{ label: 'State', value: node.protocol_state || 'UNKNOWN', note: node.boundary_kind || 'no boundary label' }},
-      {{ label: 'Traffic Rank', value: bytesRank ? `#${{bytesRank}} / ${{nodes.length}}` : 'n/a', note: 'ranked by total bytes among all nodes' }},
+      {{ label: 'Overhead Rank', value: bytesRank ? `#${{bytesRank}} / ${{nodes.length}}` : 'n/a', note: 'ranked by total bytes among all nodes' }},
       {{ label: 'Accepted Rank', value: acceptedRank ? `#${{acceptedRank}} / ${{nodes.length}}` : 'n/a', note: 'ranked by accepted messages among all nodes' }},
-      {{ label: 'Traffic', value: fmt('total_mb', toNum(node.total_mb)), note: fmt('total_bytes', toNum(node.total_bytes)) + ' total bytes' }},
-      {{ label: 'Vs Avg Traffic', value: avgBytes === null ? 'n/a' : fmt('total_bytes', (toNum(node.total_bytes) || 0) - avgBytes), note: 'difference from network average bytes' }},
+      {{ label: 'Overhead', value: fmt('total_mb', toNum(node.total_mb)), note: fmt('total_bytes', toNum(node.total_bytes)) + ' total bytes' }},
+      {{ label: 'Vs Avg Overhead', value: avgBytes === null ? 'n/a' : fmt('total_bytes', (toNum(node.total_bytes) || 0) - avgBytes), note: 'difference from network average bytes' }},
       {{ label: 'Accepted Msgs', value: fmt('accepted_messages', toNum(node.accepted_messages)), note: avgAccepted === null ? 'messages accepted by the node' : `network avg ${{
 fmt('accepted_messages', avgAccepted)
 }}` }},
@@ -3810,12 +5116,15 @@ def _write_run_html(run_dir, manifest, summary_row, watch_rows, evidence, events
     fire_stage_rows = fire_stage_rows or []
     figure_links = figure_links or []
     node_rows = _all_node_rows(evidence)
-    node_logs = _node_log_tails(run_dir, [row.get("port") for row in node_rows], max_lines=36)
     watch_ports = manifest.get("watch_ports", {})
     local_port = int(watch_ports.get("LOCAL", 0)) if watch_ports.get("LOCAL") is not None else None
     far_port = int(watch_ports.get("FAR", 0)) if watch_ports.get("FAR") is not None else None
+    log_ports = [port for port in (local_port, far_port) if port is not None]
+    node_logs = _node_log_tails(run_dir, log_ports, max_lines=HTML_NODE_LOG_LINES) if HTML_NODE_LOG_LINES > 0 else {}
+    html_table_rows = lambda rows: list(rows)[-HTML_TABLE_ROW_LIMIT:] if HTML_TABLE_ROW_LIMIT > 0 and len(rows) > HTML_TABLE_ROW_LIMIT else rows
     local_history = [row for row in history_rows if local_port is not None and _to_int(row.get("port", -1), -1) == int(local_port)]
     far_history = [row for row in history_rows if far_port is not None and _to_int(row.get("port", -1), -1) == int(far_port)]
+    replay_html, replay_script = _render_visual_replay_panel(manifest, node_rows, history_rows, timeline_rows, fire_stage_rows)
     spotlight_html, spotlight_script = _render_node_spotlight_panel(evidence, history_rows, watch_ports=watch_ports, node_logs=node_logs)
 
     cards = [
@@ -3826,7 +5135,7 @@ def _write_run_html(run_dir, manifest, summary_row, watch_rows, evidence, events
             "tone": "good" if str(summary_row.get("status", "")).strip().lower() == "ok" else "bad",
         },
         {
-            "label": "Traffic",
+            "label": "Overhead",
             "value": _format_display_value("total_mb", summary_row.get("total_mb", 0.0)),
             "note": "{} total bytes".format(_format_display_value("total_bytes", summary_row.get("total_bytes", 0))),
             "tone": "accent",
@@ -3838,7 +5147,7 @@ def _write_run_html(run_dir, manifest, summary_row, watch_rows, evidence, events
             "tone": "accent",
         },
         {
-            "label": "Detection",
+            "label": "Detection Latency",
             "value": _format_display_value("detection_speed_sec", summary_row.get("detection_speed_sec", "")) or "n/a",
             "note": "LOCAL watch first saw the scenario here",
             "tone": "accent" if _maybe_float(summary_row.get("detection_speed_sec")) is not None else "warn",
@@ -3865,9 +5174,11 @@ def _write_run_html(run_dir, manifest, summary_row, watch_rows, evidence, events
 
     sections = [
         _render_glossary_html(),
+        _render_phase_guide_html(),
         _render_field_reference_html(),
         _render_timeline_panel(timeline_rows),
         _render_fire_semantics_panel(fire_stage_rows),
+        replay_html,
         _render_table_html("Run Overview", [summary_row], RUN_OVERVIEW_FIELDS, "Color badges make the health signals easier to spot at a glance."),
         _render_spotlight_table_html("Watched Nodes", watch_rows, WATCH_OVERVIEW_FIELDS, "watch_port", "Local rows are warm-toned, far rows are cool-toned. Click a row to sync Node Spotlight."),
         spotlight_html,
@@ -3876,7 +5187,7 @@ def _write_run_html(run_dir, manifest, summary_row, watch_rows, evidence, events
             history_totals_rows,
             ["pull_rx_total", "pull_tx_total", "push_rx_total", "push_tx_total", "accepted_messages_total", "total_mb"],
             _sample_label,
-            "These sampled totals show how traffic and accepted messages evolve during the run.",
+            "These sampled totals show how throughput counters and accepted messages evolve during the run.",
         ),
         _render_chart_grid_html(
             "Local Watch History",
@@ -3920,10 +5231,10 @@ def _write_run_html(run_dir, manifest, summary_row, watch_rows, evidence, events
             else ""
         ),
         "<details><summary>Show Pull Totals Table</summary>{}</details>".format(
-            _render_table_html("Pull Totals Over Time", history_totals_rows, HISTORY_TOTAL_FIELDS)
+            _render_table_html("Pull Totals Over Time", html_table_rows(history_totals_rows), HISTORY_TOTAL_FIELDS)
         ),
         "<details><summary>Show Pull History Table</summary>{}</details>".format(
-            _render_table_html("All Sampled Pull Rows", history_rows, HISTORY_FIELDS)
+            _render_table_html("Sampled Pull Rows", html_table_rows(history_rows), HISTORY_FIELDS)
         ),
         "<details><summary>Show Full Summary Row</summary>{}</details>".format(
             _render_table_html("Full Summary Fields", [summary_row], SUMMARY_FIELDS)
@@ -3939,7 +5250,16 @@ def _write_run_html(run_dir, manifest, summary_row, watch_rows, evidence, events
         summary_row.get("run_index", ""),
         summary_row.get("seed", ""),
     )
-    _write_text(run_dir / "paper_summary.html", _html_page("Paper Evaluation Run", subtitle, _render_cards_html(cards), "".join(sections), script_html=spotlight_script))
+    _write_text(
+        run_dir / "paper_summary.html",
+        _html_page(
+            "Paper Evaluation Run",
+            subtitle,
+            _render_cards_html(cards),
+            "".join(sections),
+            script_html=(replay_script + spotlight_script),
+        ),
+    )
 
 
 def _write_suite_html(report_dir, spec, summary_rows, watch_rows, summary_by_nodes_rows, figure_links=None):
@@ -3969,7 +5289,7 @@ def _write_suite_html(report_dir, spec, summary_rows, watch_rows, summary_by_nod
             "tone": "accent",
         },
         {
-            "label": "Avg Traffic",
+            "label": "Avg Overhead",
             "value": "{:.3f} MB".format(statistics.mean(total_mb_values)) if total_mb_values else "0.000 MB",
             "note": "per run",
             "tone": "accent",
@@ -3990,8 +5310,10 @@ def _write_suite_html(report_dir, spec, summary_rows, watch_rows, summary_by_nod
 
     sections = [
         _render_glossary_html(),
+        _render_phase_guide_html(),
         _render_field_reference_html(),
         interactive_html,
+        _render_paper_highlights_html(summary_rows, watch_rows),
         nodecount_html,
         comparison_html,
         _render_run_deep_dive_html(report_dir, summary_rows),
@@ -4042,45 +5364,70 @@ def _write_suite_html(report_dir, spec, summary_rows, watch_rows, summary_by_nod
     )
 
 
-def _latest_run_dir():
+def _latest_run_dir(base_port=None):
     if not RUNS_DIR.exists():
         raise RuntimeError("runs directory does not exist yet")
     candidates = [path for path in RUNS_DIR.iterdir() if path.is_dir()]
+    if base_port is not None:
+        suffix = "_p{}".format(int(base_port))
+        candidates = [path for path in candidates if path.name.endswith(suffix)]
     if not candidates:
         raise RuntimeError("no run directories exist yet")
     return sorted(candidates, key=lambda item: item.stat().st_mtime, reverse=True)[0]
 
 
-def _stop_nodes():
-    subprocess.run(["./stop_nodes.sh"], cwd=str(ROOT_DIR), check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+def _stop_nodes(base_port=None):
+    cmd = ["./stop_nodes.sh"]
+    if base_port is not None:
+        cmd.extend(["--base-port", str(int(base_port))])
+    subprocess.run(cmd, cwd=str(ROOT_DIR), check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-def _start_nodes(number_of_nodes):
+def _start_nodes(number_of_nodes, base_port):
     env = os.environ.copy()
-    env["EGESS_LOG"] = "1"
+    env["EGESS_LOG"] = os.environ.get("EGESS_LOG", "0")
+    env["EGESS_NODE_LOG_MODE"] = os.environ.get("EGESS_NODE_LOG_MODE", "bounded")
+    env["EGESS_NODE_LOG_MAX_BYTES"] = os.environ.get("EGESS_NODE_LOG_MAX_BYTES", "16384")
+    env["EGESS_BASE_PORT"] = str(int(base_port))
     subprocess.run(
-        ["./start_nodes.sh", str(int(number_of_nodes))],
+        ["./start_nodes.sh", "--base-port", str(int(base_port)), str(int(number_of_nodes))],
         cwd=str(ROOT_DIR),
         env=env,
         check=True,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    return _latest_run_dir()
+    return _latest_run_dir(base_port)
 
 
-def _wait_until_ready(base_port, number_of_nodes, timeout_sec=35.0):
+def _ready_port(port):
+    try:
+        res = _pull_state(port, origin="bootstrap", timeout=1.2)
+        return isinstance(res, dict) and res.get("op") == "receipt"
+    except Exception:
+        return False
+
+
+def _ready_ports(base_port, number_of_nodes):
+    ports = list(range(int(base_port), int(base_port) + int(number_of_nodes)))
+    worker_count = min(len(ports), SAMPLE_WORKERS)
+    if worker_count <= 1:
+        return {int(port) for port in ports if _ready_port(port)}
+    ready = set()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
+        futures = {executor.submit(_ready_port, port): int(port) for port in ports}
+        for future in concurrent.futures.as_completed(futures):
+            if future.result():
+                ready.add(int(futures[future]))
+    return ready
+
+
+def _wait_until_ready(base_port, number_of_nodes, timeout_sec=90.0):
     deadline = time.monotonic() + float(timeout_sec)
+    seen_ready = set()
     while time.monotonic() < deadline:
-        ready = 0
-        for port in range(int(base_port), int(base_port) + int(number_of_nodes)):
-            try:
-                res = _pull_state(port, origin="bootstrap", timeout=0.8)
-                if isinstance(res, dict) and res.get("op") == "receipt":
-                    ready += 1
-            except Exception:
-                pass
-        if ready >= int(number_of_nodes):
+        seen_ready.update(_ready_ports(base_port, number_of_nodes))
+        if len(seen_ready) >= int(number_of_nodes):
             return True
         time.sleep(1.0)
     return False
@@ -4278,6 +5625,9 @@ def _stress_actions(spec, base_port, number_of_nodes, seed):
     neighbors = _neighbors_for_port(base_port, number_of_nodes, target)
     lie_port = int(neighbors[0]) if len(neighbors) > 0 else int(target)
     flap_port = int(neighbors[1]) if len(neighbors) > 1 else int(lie_port)
+    flap_off_at = max(1.0, duration_sec * 0.68)
+    recovering_at = max(1.0, duration_sec * 0.72)
+    reset_at = max(1.0, duration_sec * 0.78)
     actions = [
         {
             "at_sec": round(duration_sec * 0.15, 3),
@@ -4325,7 +5675,7 @@ def _stress_actions(spec, base_port, number_of_nodes, seed):
             "label": "flap_on",
         },
         {
-            "at_sec": round(duration_sec * 0.82, 3),
+            "at_sec": round(flap_off_at, 3),
             "kind": "fault_toggle",
             "port": int(flap_port),
             "fault": "flap",
@@ -4334,14 +5684,14 @@ def _stress_actions(spec, base_port, number_of_nodes, seed):
             "label": "flap_off",
         },
         {
-            "at_sec": round(duration_sec * 0.88, 3),
+            "at_sec": round(recovering_at, 3),
             "kind": "state_batch",
             "ports": [int(target), int(lie_port), int(flap_port)],
             "sensor_state": "RECOVERING",
             "label": "stress_recovering",
         },
         {
-            "at_sec": round(duration_sec * 0.96, 3),
+            "at_sec": round(reset_at, 3),
             "kind": "reset_batch",
             "ports": [int(target), int(lie_port), int(flap_port)],
             "label": "stress_reset",
@@ -4363,6 +5713,16 @@ def _scenario_actions(spec, base_port, number_of_nodes, seed):
     raise ValueError("unsupported scenario kind: {}".format(kind))
 
 
+def _history_capture_ports(spec, base_port, number_of_nodes, seed):
+    scope = HISTORY_SCOPE
+    if scope in ("none", "off", "0", "false"):
+        return set()
+    if scope in ("all", "full"):
+        return None
+    ports = _watch_ports(spec, base_port, number_of_nodes, seed)
+    return {int(port) for port in ports.values() if _to_int(port, -1) >= 0}
+
+
 def _watch_ports(spec, base_port, number_of_nodes, seed):
     kind = str(spec.get("scenario", {}).get("kind", "baseline")).strip().lower()
     if kind == "firebomb":
@@ -4371,7 +5731,9 @@ def _watch_ports(spec, base_port, number_of_nodes, seed):
         batches = _tornado_sweep_batches(base_port, number_of_nodes, seed, spec.get("scenario", {}).get("tornado_width", 2))
         local_watch = int(batches[0][0]) if len(batches) > 0 and len(batches[0]) > 0 else _center_port(base_port, number_of_nodes)
     elif kind == "ghost_outage_noise":
-        local_watch = _center_port(base_port, number_of_nodes)
+        target = _center_port(base_port, number_of_nodes)
+        neighbors = _neighbors_for_port(base_port, number_of_nodes, target)
+        local_watch = int(neighbors[2]) if len(neighbors) > 2 else (int(neighbors[0]) if len(neighbors) > 0 else int(target))
     else:
         local_watch = _center_port(base_port, number_of_nodes)
 
@@ -4391,63 +5753,109 @@ def _apply_action(action, events_path):
 
     if kind == "crash_batch":
         for port in action.get("ports", []):
-            res = _inject_fault(port, "crash_sim", True, period_sec=action.get("period_sec", 4))
-            _log_event(events_path, "fault", {"label": label, "port": int(port), "fault": "crash_sim", "enable": True, "response": res, "at_sec": at_sec})
+            try:
+                res = _call_with_retries(lambda port=port: _inject_fault(port, "crash_sim", True, period_sec=action.get("period_sec", 4)))
+                _log_event(events_path, "fault", {"label": label, "port": int(port), "fault": "crash_sim", "enable": True, "response": res, "at_sec": at_sec})
+            except Exception as exc:
+                _log_event(events_path, "fault_error", {"label": label, "port": int(port), "fault": "crash_sim", "enable": True, "error": str(exc), "at_sec": at_sec})
         return
 
     if kind == "recover_batch":
         for port in action.get("ports", []):
-            res_fault = _inject_fault(port, "crash_sim", False, period_sec=action.get("period_sec", 4))
-            res_state = _inject_state(port, "RECOVERING")
-            _log_event(events_path, "fault", {"label": label, "port": int(port), "fault": "crash_sim", "enable": False, "response": res_fault, "at_sec": at_sec})
-            _log_event(events_path, "state", {"label": label, "port": int(port), "sensor_state": "RECOVERING", "response": res_state, "at_sec": at_sec})
+            try:
+                res_fault = _call_with_retries(lambda port=port: _inject_fault(port, "crash_sim", False, period_sec=action.get("period_sec", 4)))
+                _log_event(events_path, "fault", {"label": label, "port": int(port), "fault": "crash_sim", "enable": False, "response": res_fault, "at_sec": at_sec})
+            except Exception as exc:
+                _log_event(events_path, "fault_error", {"label": label, "port": int(port), "fault": "crash_sim", "enable": False, "error": str(exc), "at_sec": at_sec})
+            try:
+                res_state = _call_with_retries(lambda port=port: _inject_state(port, "RECOVERING"))
+                _log_event(events_path, "state", {"label": label, "port": int(port), "sensor_state": "RECOVERING", "response": res_state, "at_sec": at_sec})
+            except Exception as exc:
+                _log_event(events_path, "state_error", {"label": label, "port": int(port), "sensor_state": "RECOVERING", "error": str(exc), "at_sec": at_sec})
         return
 
     if kind == "reset_batch":
-        for port in action.get("ports", []):
-            res_reset = _inject_fault(port, "reset", True, period_sec=action.get("period_sec", 4))
-            res_state = _inject_state(port, "NORMAL")
-            _log_event(events_path, "fault", {"label": label, "port": int(port), "fault": "reset", "enable": True, "response": res_reset, "at_sec": at_sec})
-            _log_event(events_path, "state", {"label": label, "port": int(port), "sensor_state": "NORMAL", "response": res_state, "at_sec": at_sec})
+        def reset_one(port):
+            result = {}
+            try:
+                result["fault_response"] = _call_with_retries(lambda: _inject_fault(port, "reset", True, period_sec=action.get("period_sec", 4)))
+            except Exception as exc:
+                result["fault_error"] = str(exc)
+            try:
+                result["state_response"] = _call_with_retries(lambda: _inject_state(port, "NORMAL"))
+            except Exception as exc:
+                result["state_error"] = str(exc)
+            return result
+
+        for port, result in _parallel_port_results(action.get("ports", []), reset_one):
+            if "fault_response" in result:
+                _log_event(events_path, "fault", {"label": label, "port": int(port), "fault": "reset", "enable": True, "response": result["fault_response"], "at_sec": at_sec})
+            else:
+                _log_event(events_path, "fault_error", {"label": label, "port": int(port), "fault": "reset", "enable": True, "error": str(result.get("fault_error", "unknown")), "at_sec": at_sec})
+            if "state_response" in result:
+                _log_event(events_path, "state", {"label": label, "port": int(port), "sensor_state": "NORMAL", "response": result["state_response"], "at_sec": at_sec})
+            else:
+                _log_event(events_path, "state_error", {"label": label, "port": int(port), "sensor_state": "NORMAL", "error": str(result.get("state_error", "unknown")), "at_sec": at_sec})
         return
 
     if kind == "fault_toggle":
-        res = _inject_fault(
-            action.get("port"),
-            action.get("fault"),
-            bool(action.get("enable", True)),
-            period_sec=action.get("period_sec", 4),
-        )
-        _log_event(
-            events_path,
-            "fault",
-            {
-                "label": label,
-                "port": int(action.get("port")),
-                "fault": str(action.get("fault")),
-                "enable": bool(action.get("enable", True)),
-                "period_sec": int(action.get("period_sec", 4)),
-                "response": res,
-                "at_sec": at_sec,
-            },
-        )
+        try:
+            res = _call_with_retries(
+                lambda: _inject_fault(
+                    action.get("port"),
+                    action.get("fault"),
+                    bool(action.get("enable", True)),
+                    period_sec=action.get("period_sec", 4),
+                )
+            )
+            _log_event(
+                events_path,
+                "fault",
+                {
+                    "label": label,
+                    "port": int(action.get("port")),
+                    "fault": str(action.get("fault")),
+                    "enable": bool(action.get("enable", True)),
+                    "period_sec": int(action.get("period_sec", 4)),
+                    "response": res,
+                    "at_sec": at_sec,
+                },
+            )
+        except Exception as exc:
+            _log_event(
+                events_path,
+                "fault_error",
+                {
+                    "label": label,
+                    "port": int(action.get("port")),
+                    "fault": str(action.get("fault")),
+                    "enable": bool(action.get("enable", True)),
+                    "period_sec": int(action.get("period_sec", 4)),
+                    "error": str(exc),
+                    "at_sec": at_sec,
+                },
+            )
         return
 
     if kind == "state_batch":
         for port in action.get("ports", []):
-            res = _inject_state(port, action.get("sensor_state", "NORMAL"))
-            _log_event(events_path, "state", {"label": label, "port": int(port), "sensor_state": str(action.get("sensor_state", "NORMAL")), "response": res, "at_sec": at_sec})
+            try:
+                res = _call_with_retries(lambda port=port: _inject_state(port, action.get("sensor_state", "NORMAL")))
+                _log_event(events_path, "state", {"label": label, "port": int(port), "sensor_state": str(action.get("sensor_state", "NORMAL")), "response": res, "at_sec": at_sec})
+            except Exception as exc:
+                _log_event(events_path, "state_error", {"label": label, "port": int(port), "sensor_state": str(action.get("sensor_state", "NORMAL")), "error": str(exc), "at_sec": at_sec})
         return
 
     raise ValueError("unsupported action kind: {}".format(kind))
 
 
-def _run_active_window(spec, base_port, number_of_nodes, run_index, seed, events_path, history_path=None, history_totals_path=None):
+def _run_active_window(spec, base_port, number_of_nodes, run_index, seed, events_path, history_path=None, history_totals_path=None, run_dir=None):
     duration_sec = _to_float(spec.get("duration_sec", 60), 60.0)
     trigger_interval_sec = max(0.25, _to_float(spec.get("trigger_interval_sec", 2), 2.0))
     sample_interval_sec = max(0.5, _to_float(spec.get("sample_interval_sec", 1.0), 1.0))
     ports = list(range(int(base_port), int(base_port) + int(number_of_nodes)))
     actions = sorted(_scenario_actions(spec, base_port, number_of_nodes, seed), key=lambda item: float(item.get("at_sec", 0.0)))
+    history_ports = _history_capture_ports(spec, base_port, number_of_nodes, seed)
 
     start = time.monotonic()
     deadline = start + float(duration_sec)
@@ -4456,18 +5864,23 @@ def _run_active_window(spec, base_port, number_of_nodes, run_index, seed, events
     trigger_index = 0
     sample_index = 0
     action_index = 0
+    sample_action_guard_sec = max(0.75, min(4.0, float(number_of_nodes) * 0.08))
 
     _log_event(events_path, "stage", {"name": "active_window_start", "duration_sec": duration_sec, "at_sec": 0.0})
+    if run_dir is not None:
+        _write_live_run_html(run_dir, spec, run_index, seed, number_of_nodes, events_path, "RUNNING", 0.0, duration_sec, history_totals_path=history_totals_path)
 
     while True:
         now = time.monotonic()
-        if now >= deadline:
-            break
-
         elapsed = now - start
         while action_index < len(actions) and elapsed >= float(actions[action_index].get("at_sec", 0.0)):
             _apply_action(actions[action_index], events_path)
             action_index += 1
+            now = time.monotonic()
+            elapsed = now - start
+
+        if now >= deadline:
+            break
 
         if now >= next_trigger:
             port = ports[trigger_index % len(ports)]
@@ -4479,15 +5892,30 @@ def _run_active_window(spec, base_port, number_of_nodes, run_index, seed, events
             except Exception as exc:
                 _log_event(events_path, "trigger_error", {"port": int(port), "label": label, "error": str(exc), "at_sec": round(float(elapsed), 3)})
             trigger_index += 1
-            next_trigger += float(trigger_interval_sec)
+            next_trigger = time.monotonic() + float(trigger_interval_sec)
+            now = time.monotonic()
+            elapsed = now - start
+            while action_index < len(actions) and elapsed >= float(actions[action_index].get("at_sec", 0.0)):
+                _apply_action(actions[action_index], events_path)
+                action_index += 1
+                now = time.monotonic()
+                elapsed = now - start
 
         if history_path is not None and history_totals_path is not None and now >= next_sample:
-            history_rows, totals_row = _sample_nodes(base_port, number_of_nodes, sample_index, now - start)
+            next_action_sec = None
+            if action_index < len(actions):
+                next_action_sec = float(actions[action_index].get("at_sec", 0.0))
+            if next_action_sec is not None and (next_action_sec - elapsed) <= sample_action_guard_sec:
+                next_sample = time.monotonic() + float(sample_interval_sec)
+                continue
+            history_rows, totals_row = _sample_nodes(base_port, number_of_nodes, sample_index, now - start, history_ports=history_ports)
             for row in history_rows:
                 _append_jsonl(history_path, row)
             _append_jsonl(history_totals_path, totals_row)
             sample_index += 1
-            next_sample += float(sample_interval_sec)
+            next_sample = time.monotonic() + float(sample_interval_sec)
+            if run_dir is not None:
+                _write_live_run_html(run_dir, spec, run_index, seed, number_of_nodes, events_path, "RUNNING", now - start, duration_sec, history_totals_path=history_totals_path)
 
         remaining = max(0.0, deadline - time.monotonic())
         time.sleep(min(0.05, remaining if remaining > 0.0 else 0.0))
@@ -4495,6 +5923,8 @@ def _run_active_window(spec, base_port, number_of_nodes, run_index, seed, events
     active_duration_sec = round(float(time.monotonic() - start), 3)
 
     _log_event(events_path, "done", {"active_duration_sec": active_duration_sec, "trigger_count": int(trigger_index), "at_sec": active_duration_sec})
+    if run_dir is not None:
+        _write_live_run_html(run_dir, spec, run_index, seed, number_of_nodes, events_path, "COLLECTING", active_duration_sec, duration_sec, history_totals_path=history_totals_path)
     return active_duration_sec, int(trigger_index)
 
 
@@ -4522,7 +5952,7 @@ def _collect_evidence(spec, run_dir, events_path, base_port, number_of_nodes, ru
 
     for port in range(int(base_port), int(base_port) + int(number_of_nodes)):
         try:
-            res = _pull_state(port, origin="paper_report", timeout=1.0)
+            res = _call_with_retries(lambda port=port: _pull_state(port, origin="paper_report", timeout=2.0), attempts=2, delay_sec=0.2)
             state = res.get("data", {}).get("node_state", {}) if isinstance(res, dict) else {}
             counters = state.get("msg_counters", {})
             if not isinstance(counters, dict):
@@ -4533,9 +5963,10 @@ def _collect_evidence(spec, run_dir, events_path, base_port, number_of_nodes, ru
             false_unavailable_count = _false_unavailable_refs_from_state(state)
             false_positive_nodes += int(false_positive_flag)
             false_unavailable_refs += int(false_unavailable_count)
+            compact_state = _compact_node_state_for_evidence(state, false_unavailable_count)
             nodes[str(port)] = {
                 "reachable": True,
-                "state": state,
+                "state": compact_state,
                 "msg_counters": counters,
                 "derived": {
                     "false_positive_flag": int(false_positive_flag),
@@ -4630,6 +6061,7 @@ def _collect_evidence(spec, run_dir, events_path, base_port, number_of_nodes, ru
         "duration_sec": _to_int(spec.get("duration_sec", 60), 60),
         "active_duration_sec": float(active_duration_sec),
         "nodes": int(number_of_nodes),
+        "base_port": int(base_port),
         "run_index": int(run_index),
         "seed": int(seed),
         "run_dir": str(run_dir.relative_to(ROOT_DIR)),
@@ -4673,6 +6105,7 @@ def _collect_evidence(spec, run_dir, events_path, base_port, number_of_nodes, ru
         "duration_sec": _to_int(spec.get("duration_sec", 60), 60),
         "active_duration_sec": float(active_duration_sec),
         "nodes": int(number_of_nodes),
+        "base_port": int(base_port),
         "run_index": int(run_index),
         "seed": int(seed),
         "watch_ports": watch_ports,
@@ -4724,19 +6157,20 @@ def _write_run_reports(run_dir, manifest, summary_row, watch_rows, evidence, eve
     _write_tsv(history_totals_tsv_path, history_totals_rows, HISTORY_TOTAL_FIELDS)
     _write_tsv(timeline_tsv_path, timeline_rows, TIMELINE_FIELDS)
     _write_tsv(fire_stage_tsv_path, fire_stage_rows, FIRE_STAGE_FIELDS)
-    _write_run_html(
-        run_dir,
-        manifest,
-        summary_row,
-        watch_rows,
-        evidence,
-        events_path,
-        history_rows=history_rows,
-        history_totals_rows=history_totals_rows,
-        timeline_rows=timeline_rows,
-        fire_stage_rows=fire_stage_rows,
-        figure_links=figure_links,
-    )
+    if WRITE_RUN_HTML:
+        _write_run_html(
+            run_dir,
+            manifest,
+            summary_row,
+            watch_rows,
+            evidence,
+            events_path,
+            history_rows=history_rows,
+            history_totals_rows=history_totals_rows,
+            timeline_rows=timeline_rows,
+            fire_stage_rows=fire_stage_rows,
+            figure_links=figure_links,
+        )
 
     lines = [
         "# {}".format(manifest.get("phase_name", "Paper Evaluation Run")),
@@ -4764,7 +6198,7 @@ def _write_run_reports(run_dir, manifest, summary_row, watch_rows, evidence, eve
             summary_row.get("tx_timeout_total", ""),
             summary_row.get("tx_conn_error_total", ""),
         ),
-        "- Visual dashboard: `paper_summary.html`",
+        "- Visual dashboard: `{}`".format("paper_summary.html" if WRITE_RUN_HTML else "disabled for data-only run"),
         "- Events JSONL: `{}`".format(str(Path(events_path).name)),
         "- Summary TSV: `{}`".format(summary_tsv_path.name),
         "- Watch TSV: `{}`".format(watch_tsv_path.name),
@@ -4773,23 +6207,32 @@ def _write_run_reports(run_dir, manifest, summary_row, watch_rows, evidence, eve
         "- Pull-totals TSV: `{}`".format(history_totals_tsv_path.name),
         "- Timeline TSV: `{}`".format(timeline_tsv_path.name),
         "- Fire-stage TSV: `{}`".format(fire_stage_tsv_path.name),
-        "- Figure exports: `figure_exports/README.md`",
+        "- Figure exports: `{}`".format("figure_exports/README.md" if figure_links else "disabled for data-only run"),
     ]
     with open(summary_md_path, "w", encoding="utf-8") as handle:
         handle.write("\n".join(lines) + "\n")
 
+    if not KEEP_HISTORY_JSONL:
+        _remove_file_if_exists(history_path)
+        _remove_file_if_exists(history_totals_path)
 
-def _suite_case_rows(spec, max_runs=None, node_counts_override=None):
+
+def _suite_case_rows(spec, max_runs=None, node_counts_override=None, batch_start=1):
     node_counts = spec.get("node_counts", [])
     if node_counts_override:
         node_counts = [int(value) for value in node_counts_override]
-    run_count = _to_int(spec.get("run_count", 1), 1)
+    total_runs = _to_int(spec.get("run_count", 1), 1)
+    batch_start = max(1, _to_int(batch_start, 1))
+    if batch_start > int(total_runs):
+        raise ValueError("batch_start {} is beyond configured run_count {}".format(int(batch_start), int(total_runs)))
+    run_count = int(total_runs) - int(batch_start) + 1
     if max_runs is not None:
         run_count = min(int(run_count), int(max_runs))
+    batch_end = int(batch_start) + int(run_count) - 1
     base_seed = _to_int(spec.get("seed_base", 1000), 1000)
     rows = []
     for node_count in node_counts:
-        for run_index in range(1, int(run_count) + 1):
+        for run_index in range(int(batch_start), int(batch_end) + 1):
             rows.append(
                 {
                     "nodes": int(node_count),
@@ -4836,7 +6279,37 @@ def _suite_summary_rows(summary_rows):
     return out
 
 
-def _write_suite_reports(report_dir, spec, summary_rows, watch_rows):
+def _write_google_sheet_exports(report_dir, summary_rows, watch_rows, summary_by_nodes_rows, metric_rows, comparison_rows):
+    sheet_dir = report_dir / "google_sheets"
+    sheet_dir.mkdir(parents=True, exist_ok=True)
+    exports = [
+        ("all_runs.csv", summary_rows, SUMMARY_FIELDS, "Full run-level data"),
+        ("run_overview.csv", summary_rows, RUN_OVERVIEW_FIELDS, "Small run overview table"),
+        ("all_watch_nodes.csv", watch_rows, WATCH_FIELDS, "Full watched-node data"),
+        ("watched_nodes_overview.csv", watch_rows, WATCH_OVERVIEW_FIELDS, "Small watched-node overview table"),
+        ("summary_by_nodes.csv", summary_by_nodes_rows, SUMMARY_BY_NODES_FIELDS, "Grouped 49/64/81 node-count summary"),
+        ("metric_averages.csv", metric_rows, ["metric", "field", "samples", "avg", "min", "max", "latest"], "Average/min/max/latest for every chart metric"),
+        ("protocol_comparison.csv", comparison_rows, COMPARISON_FIELDS, "Cross-protocol comparison table when available"),
+    ]
+    links = []
+    readme_lines = [
+        "# Google Sheets Exports",
+        "",
+        "Upload these CSV files directly into Google Sheets.",
+        "The TSV files in the parent dashboard are still kept for scripts and reproducibility.",
+        "",
+    ]
+    for filename, rows, fields, note in exports:
+        path = sheet_dir / filename
+        _write_csv(path, rows, fields)
+        links.append(("google_sheets/{}".format(filename), "google_sheets/{}".format(filename)))
+        readme_lines.append("- `{}`: {}".format(filename, note))
+    _write_text(sheet_dir / "README.md", "\n".join(readme_lines) + "\n")
+    links.insert(0, ("google_sheets/README.md", "google_sheets/README.md"))
+    return links
+
+
+def _write_suite_reports(report_dir, spec, summary_rows, watch_rows, full_figures=True):
     all_runs_tsv = report_dir / "all_runs.tsv"
     all_watch_tsv = report_dir / "all_watch_nodes.tsv"
     summary_by_nodes_tsv = report_dir / "summary_by_nodes.tsv"
@@ -4849,11 +6322,13 @@ def _write_suite_reports(report_dir, spec, summary_rows, watch_rows):
 
     summary_by_nodes_rows = _suite_summary_rows(summary_rows)
     comparison_rows = _build_protocol_comparison_rows()
-    figure_links = _write_suite_figure_exports(report_dir, summary_rows)
+    metric_rows = _metric_summary_rows(summary_rows, SUMMARY_CHART_FIELDS)
+    figure_links = _write_suite_figure_exports(report_dir, summary_rows, full=bool(full_figures))
+    sheet_links = _write_google_sheet_exports(report_dir, summary_rows, watch_rows, summary_by_nodes_rows, metric_rows, comparison_rows)
     _write_tsv(summary_by_nodes_tsv, summary_by_nodes_rows, SUMMARY_BY_NODES_FIELDS)
-    _write_tsv(metric_averages_tsv, _metric_summary_rows(summary_rows, SUMMARY_CHART_FIELDS), ["metric", "samples", "avg", "min", "max", "latest"])
+    _write_tsv(metric_averages_tsv, metric_rows, ["metric", "field", "samples", "avg", "min", "max", "latest"])
     _write_tsv(comparison_tsv, comparison_rows, COMPARISON_FIELDS)
-    _write_suite_html(report_dir, spec, summary_rows, watch_rows, summary_by_nodes_rows, figure_links=figure_links)
+    _write_suite_html(report_dir, spec, summary_rows, watch_rows, summary_by_nodes_rows, figure_links=figure_links + sheet_links)
 
     lines = [
         "# {}".format(spec.get("phase_name", "Paper Evaluation Suite")),
@@ -4868,6 +6343,7 @@ def _write_suite_reports(report_dir, spec, summary_rows, watch_rows):
         "- Grouped summary: `summary_by_nodes.tsv`",
         "- Metric averages: `metric_averages.tsv`",
         "- Protocol comparison: `protocol_comparison.tsv`",
+        "- Google Sheets CSV exports: `google_sheets/`",
         "- Figure exports: `figure_exports/README.md`",
     ]
     with open(summary_md, "w", encoding="utf-8") as handle:
@@ -4898,8 +6374,16 @@ def _validate_spec(spec):
 
 def _report_dir_for_spec(spec):
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-    stamp = time.strftime("%Y%m%d_%H%M%S")
-    report_dir = REPORTS_DIR / "{}_{}".format(str(spec.get("suite_id", "suite")), stamp)
+    base_port = _to_int(spec.get("base_port", 0), 0)
+    suffix = "_p{}".format(base_port) if base_port > 0 else ""
+    base_stamp = "{}{}".format(time.strftime("%Y%m%d_%H%M%S"), suffix)
+    suite_id = str(spec.get("suite_id", "suite"))
+    stamp = base_stamp
+    collision_index = 2
+    while (REPORTS_DIR / "{}_{}".format(suite_id, stamp)).exists():
+        stamp = "{}_r{}".format(base_stamp, collision_index)
+        collision_index += 1
+    report_dir = REPORTS_DIR / "{}_{}".format(suite_id, stamp)
     report_dir.mkdir(parents=True, exist_ok=True)
     return report_dir
 
@@ -4910,9 +6394,11 @@ def _run_case(spec_for_run, case):
     run_index = int(case["run_index"])
     seed = int(case["seed"])
 
-    _stop_nodes()
+    _stop_nodes(base_port)
     try:
-        run_dir = _start_nodes(number_of_nodes)
+        time.sleep(1.5)
+        run_dir = _start_nodes(number_of_nodes, base_port)
+        time.sleep(1.0)
 
         if not _wait_until_ready(base_port, number_of_nodes):
             raise RuntimeError("timed out waiting for {} nodes to become reachable".format(number_of_nodes))
@@ -4920,6 +6406,7 @@ def _run_case(spec_for_run, case):
         events_path = run_dir / "paper_events.jsonl"
         history_path = run_dir / "paper_pull_history.jsonl"
         history_totals_path = run_dir / "paper_pull_totals.jsonl"
+        _write_live_run_html(run_dir, spec_for_run, run_index, seed, number_of_nodes, events_path, "STARTING", 0.0, spec_for_run.get("duration_sec", 60), history_totals_path=history_totals_path)
         active_duration_sec, _ = _run_active_window(
             spec_for_run,
             base_port,
@@ -4929,6 +6416,7 @@ def _run_case(spec_for_run, case):
             events_path,
             history_path=history_path,
             history_totals_path=history_totals_path,
+            run_dir=run_dir,
         )
         manifest, summary_row, watch_rows_case, evidence = _collect_evidence(
             spec=spec_for_run,
@@ -4950,6 +6438,7 @@ def _run_case(spec_for_run, case):
             history_path=history_path,
             history_totals_path=history_totals_path,
         )
+        _write_live_run_html(run_dir, spec_for_run, run_index, seed, number_of_nodes, events_path, "DONE", active_duration_sec, spec_for_run.get("duration_sec", 60), history_totals_path=history_totals_path)
         return {
             "run_dir": run_dir,
             "manifest": manifest,
@@ -4958,15 +6447,17 @@ def _run_case(spec_for_run, case):
             "evidence": evidence,
         }
     finally:
-        _stop_nodes()
+        _stop_nodes(base_port)
 
 
-def run_suite(spec, dry_run=False, max_runs=None, node_counts_override=None, duration_sec_override=None):
+def run_suite(spec, dry_run=False, max_runs=None, node_counts_override=None, duration_sec_override=None, base_port_override=None, batch_start=1):
     _validate_spec(spec)
     spec_for_run = dict(spec)
     if duration_sec_override is not None:
         spec_for_run["duration_sec"] = int(duration_sec_override)
-    cases = _suite_case_rows(spec, max_runs=max_runs, node_counts_override=node_counts_override)
+    if base_port_override is not None:
+        spec_for_run["base_port"] = int(base_port_override)
+    cases = _suite_case_rows(spec, max_runs=max_runs, node_counts_override=node_counts_override, batch_start=batch_start)
     report_dir = _report_dir_for_spec(spec_for_run)
 
     if dry_run:
@@ -4976,6 +6467,7 @@ def run_suite(spec, dry_run=False, max_runs=None, node_counts_override=None, dur
             "phase_id": spec_for_run.get("phase_id"),
             "challenge": spec_for_run.get("challenge"),
             "duration_sec": spec_for_run.get("duration_sec"),
+            "batch_start": int(batch_start),
         }
         _write_json(report_dir / "dry_run_manifest.json", dry_payload)
         print(json.dumps(dry_payload, indent=2))
@@ -4988,9 +6480,9 @@ def run_suite(spec, dry_run=False, max_runs=None, node_counts_override=None, dur
         result = _run_case(spec_for_run, case)
         summary_rows.append(result["summary_row"])
         watch_rows.extend(result["watch_rows"])
-        _write_suite_reports(report_dir, spec_for_run, summary_rows, watch_rows)
+        _write_suite_reports(report_dir, spec_for_run, summary_rows, watch_rows, full_figures=False)
 
-    _write_suite_reports(report_dir, spec_for_run, summary_rows, watch_rows)
+    _write_suite_reports(report_dir, spec_for_run, summary_rows, watch_rows, full_figures=True)
     return report_dir
 
 
@@ -5001,6 +6493,8 @@ def main():
     parser.add_argument("--max-runs", type=int, help="Optional cap for run_count while testing the suite")
     parser.add_argument("--node-counts", help="Optional comma-separated override for node counts, e.g. 49,64")
     parser.add_argument("--duration-sec", type=int, help="Optional override for a shorter same-machine smoke test duration")
+    parser.add_argument("--base-port", type=int, help="Optional base port override for shared-server lab runs")
+    parser.add_argument("--batch-start", type=int, default=1, help="First batch/run index to execute when chunking a 30-run suite")
     args = parser.parse_args()
 
     spec_path = Path(args.spec).resolve()
@@ -5017,6 +6511,8 @@ def main():
             max_runs=args.max_runs,
             node_counts_override=node_counts_override,
             duration_sec_override=args.duration_sec,
+            base_port_override=args.base_port,
+            batch_start=args.batch_start,
         )
     except Exception as exc:
         print("ERROR: {}".format(exc), file=sys.stderr)
